@@ -1,0 +1,16 @@
+app:
+  app:
+    title: "new_app_backend"
+    version: "1.0.0"
+  logging:
+    level: "INFO"
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  db:
+    user: "app_db_user"
+    name: "NEW_APP"
+    password: "app_db_pass"
+    host: "localhost"
+    port: "5432"
+  http:
+    port: 8000
+    host: "0.0.0.0" 

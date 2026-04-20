@@ -1,0 +1,61 @@
+services:
+  db:
+    image: postgres:16
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${NEW__APP__DB__NAME}
+      POSTGRES_USER: ${NEW__APP__DB__USER}
+      POSTGRES_PASSWORD: ${NEW__APP__DB__PASSWORD}
+    ports:
+      - "${NEW__APP__DB__PORT}:${NEW__APP__DB__PORT}"
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: >
+      sh -c "redis-server --requirepass $${NEW__APP__REDIS__PASSWORD:-my_redis_pass}"
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: ${NEW__APP__RABBITMQ__USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${NEW__APP__RABBITMQ__PASSWORD:-guest}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      - db
+      - redis
+      - rabbitmq
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - NEW__APP__DB__HOST=db
+      - NEW__APP__REDIS__HOST=redis
+      - NEW__APP__RABBITMQ__HOST=rabbitmq
+
+  worker:
+    build: .
+    # Флаг -B запускает планировщик, -Q говорит слушать все нужные очереди
+    command: celery -A app.infra.celery_app worker -Q critical,maintenance,celery -B --loglevel=info
+    depends_on:
+      - db
+      - redis
+      - rabbitmq
+    env_file:
+      - .env
+    environment:
+      - NEW__APP__DB__HOST=db
+      - NEW__APP__REDIS__HOST=redis
+      - NEW__APP__RABBITMQ__HOST=rabbitmq
