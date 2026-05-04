@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config.settings import settings
 from app.infra.db import Base
+from app.models.admin_log import AdminLog  # noqa: F401
 
 # Обязательно импортируем модели, чтобы alembic их видел
 from app.models.user import User  # noqa: F401

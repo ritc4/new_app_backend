@@ -1,28 +1,18 @@
 import json
 import logging
 import secrets
-from typing import Any
 
 from fastapi import HTTPException, Request, status
 from jose import JWTError, jwt
 from redis.asyncio import Redis
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import (
-    ALGORITHM,
-    SECRET_KEY,
-    create_tokens,
-    credentials_exception,
-    get_session_info,
-)
+from app.config.settings import settings
+from app.core.exceptions import credentials_exception
+from app.core.jwt import ALGORITHM, SECRET_KEY, create_tokens, get_session_info
 from app.models.user import User
 from app.repositories.user_repository import UserRepository
-from app.schemas.auth import CompleteRegistrationRequest
-from app.schemas.user import UserRole
-from app.workers.auth.tasks import send_flash_call_task
 
-# Иерархическое имя логгера для Enterprise-мониторинга
 logger = logging.getLogger("app.services.auth")
 
 
@@ -32,310 +22,251 @@ class AuthService:
         self.redis = redis_client
         self.users = UserRepository(db)
 
-    # --- РАБОТА С ПРОФИЛЕМ ---
+    # --- НОВОЕ: Методы для слоя безопасности (get_current_user) ---
 
-    async def get_user_by_id(self, user_id: int) -> User:
-        """Получение пользователя с логированием промахов."""
+    async def validate_user_access(self, user_id: int, session_id: str) -> User:
+        """Бизнес-логика проверки доступа (используется в get_current_user)."""
+        # 1. Валидация сессии в Redis
+        if not await self.redis.exists(f"refresh:{user_id}:{session_id}"):
+            raise credentials_exception
+
+        # 2. Получение и проверка статуса пользователя
         user = await self.users.get_by_id(user_id)
-        if not user:
-            logger.warning(f"Пользователь ID {user_id} не найден.")
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
+
+        if not user or user.is_banned or user.deleted_at is not None or not user.is_active:
+            if user_id:
+                await self.logout(user_id, session_id)
+
+            if user and not user.is_active:
+                detail = "Аккаунт деактивирован"
+            elif user and user.is_banned:
+                detail = "Аккаунт заблокирован"
+            else:
+                detail = "Аккаунт удален"
+
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=detail)
+
         return user
 
-    async def complete_registration(
-        self, user_id: int, data: CompleteRegistrationRequest
-    ) -> User:
-        """Завершение регистрации с защитой транзакции."""
+    async def update_user_activity_bg(self, user_id: int, app_version: str):
+        """Фоновая задача обновления активности."""
         try:
-            logger.info(f"Завершение регистрации для User ID {user_id}")
-            user = await self.users.update_profile(
-                user_id=user_id, first_name=data.first_name, last_name=data.last_name
-            )
-            logger.info(f"Профиль User ID {user_id} успешно обновлен.")
-            return user
-        except SQLAlchemyError as e:
-            logger.error(f"Ошибка БД при обновлении профиля {user_id}: {e}")
-            raise HTTPException(
-                status.HTTP_500_INTERNAL_SERVER_ERROR, "Ошибка сохранения данных"
-            ) from e
+            await self.users.update_activity(user_id, app_version)
+            await self.db.commit()
+            logger.info(f"Активность пользователя {user_id} успешно обновлена.")
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Ошибка при обновлении активности пользователя {user_id}: {e}")
 
-    async def update_username(self, user_id: int, username: str) -> None:
-        """Обновление ника с проверкой уникальности."""
-        try:
-            existing_user = await self.users.get_by_username(username)
-            if existing_user and existing_user.id != user_id:
-                logger.warning(f"Конфликт имен: ник '{username}' уже занят.")
-                raise HTTPException(status.HTTP_400_BAD_REQUEST, "Ник занят")
-
-            await self.users.update_username(user_id, username)
-            logger.info(f"User ID {user_id} сменил ник на '{username}'")
-        except SQLAlchemyError as e:
-            logger.error(f"Ошибка БД при смене ника для {user_id}: {e}")
-            raise HTTPException(
-                status.HTTP_500_INTERNAL_SERVER_ERROR, "Ошибка обновления ника"
-            ) from e
-
-    # --- OTP ЛОГИКА ---
-
-    async def _check_otp_limits(self, phone: str, ip: str) -> None:
-        """Проверка лимитов для защиты от спама звонками."""
-        if await self.redis.exists(f"limit:otp_req_phone:{phone}"):
-            logger.warning(f"Лимит OTP превышен по номеру: {phone}")
-            raise HTTPException(
-                status.HTTP_429_TOO_MANY_REQUESTS, "Слишком часто (номер)"
-            )
-
-        if await self.redis.exists(f"limit:otp_req_ip:{ip}"):
-            logger.warning(f"Лимит OTP превышен по IP: {ip}")
-            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Слишком часто (IP)")
+    # --- ОСНОВНЫЕ МЕТОДЫ СЕРВИСА ---
 
     async def request_otp(self, phone: str, ip: str) -> None:
-        """Запрос OTP и постановка задачи в Celery."""
+        # 1. Сначала проверяем, не на тех.обслуживании ли мы
+        if settings.app.maintenance_mode:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Сервис временно недоступен. Ведутся технические работы.",
+            )
 
-        logger.info(f"Запрос OTP: {phone} (IP: {ip})")
         await self._check_otp_limits(phone, ip)
-
         otp = "".join(str(secrets.randbelow(10)) for _ in range(4))
 
         await self.redis.set(f"otp:{phone}", otp, ex=300)
         await self.redis.set(f"limit:otp_req_phone:{phone}", "1", ex=60)
-        await self.redis.set(f"limit:otp_req_ip:{ip}", "1", ex=20)
+        await self.redis.set(f"limit:otp_req_ip:{ip}", "1", ex=60)
+
+        # Инкрементируем дневной счетчик
+        daily_key = f"limit:otp_daily:{phone}"
+        await self.redis.incr(daily_key)
+        await self.redis.expire(daily_key, 86400)
+        from app.workers.auth.tasks import send_flash_call_task
 
         send_flash_call_task.delay(phone, otp)
-        logger.info(f"Задача Flash Call для {phone} отправлена в воркер.")
+        logger.info(f"Задача Flash Call для {phone} отправлена.")
 
-    async def verify_otp_code(self, phone: str, code: str) -> None:
-        """Верификация с защитой от брутфорса."""
-        retry_key = f"limit:otp_retry:{phone}"
-        retries = await self.redis.get(retry_key)
+    async def login_or_register(self, phone: str, request: Request) -> tuple[str, str, bool]:
+        """
+        Вход или регистрация.
+        is_new=True только для тех, кого ВООБЩЕ нет в базе.
+        """
+        if settings.app.maintenance_mode:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="Тех. обслуживание")
 
-        if retries and int(retries) >= 5:
-            logger.error(f"Брутфорс OTP: превышено число попыток для {phone}")
-            raise HTTPException(
-                status.HTTP_429_TOO_MANY_REQUESTS, "Много попыток. Бан 15 минут."
-            )
-
-        stored_otp = await self.redis.get(f"otp:{phone}")
-        if not stored_otp or stored_otp != code:
-            new_retries = await self.redis.incr(retry_key)
-            if int(new_retries) == 1:
-                await self.redis.expire(retry_key, 900)
-            logger.warning(f"Неверный код для {phone}. Попытка №{new_retries}")
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Неверный код")
-
-        await self.redis.delete(retry_key)
-        await self.redis.delete(f"otp:{phone}")
-        logger.info(f"OTP подтвержден успешно: {phone}")
-
-    # --- ВХОД И СЕССИИ ---
-
-    async def login_or_register(
-        self, phone: str, request: Request
-    ) -> tuple[str, str, bool]:
-        """Автоматическая регистрация или вход."""
         try:
             app_version = request.headers.get("X-App-Version", "1.0.0")
-            user = await self.users.get_by_phone(phone)
 
-            if user and user.is_banned:
-                logger.critical(f"Попытка входа забаненного пользователя: {phone}")
+            # 1. Ищем пользователя, включая удаленных (Soft Delete)
+            existing_user = await self.users.get_by_phone_include_deleted(phone)
+
+            # ОПРЕДЕЛЯЕМ НОВИЗНУ:
+            # Если юзера нет в БД вообще — он НОВЫЙ.
+            # Если юзер есть (даже удаленный) — он СТАРЫЙ (возвращенец).
+            is_new = not bool(existing_user)
+
+            # 2. Выполняем Upsert (Создание или Восстановление)
+            # Этот метод в репозитории сбросит deleted_at в None, если юзер был удален
+            user = await self.users.create_with_phone(phone, app_version)
+
+            # 3. Проверка на бан (всегда важна)
+            if user.is_banned:
                 raise HTTPException(status.HTTP_403_FORBIDDEN, "Аккаунт заблокирован")
 
-            is_new = False
-            if not user:
-                logger.info(f"Регистрация нового пользователя: {phone}")
-                is_new = True
-                user = await self.users.create_with_phone(phone, app_version)
-            else:
-                logger.info(f"Вход User ID {user.id} ({phone})")
-                await self.users.update_activity(user.id, app_version)
-                if not user.first_name:
-                    is_new = True
+            await self.db.commit()
 
+            # Логирование для аналитики
+            if is_new:
+                logger.info(f"Новый пользователь: {phone}")
+            elif existing_user and existing_user.deleted_at:
+                logger.info(f"Пользователь ВОССТАНОВИЛСЯ после удаления: {phone}")
+            else:
+                logger.info(f"Обычный вход: {phone}")
+
+            # 4. Генерация токенов
             device, ip = get_session_info(request)
             access, refresh = await create_tokens(user, device, ip, self.redis)
-            return access, refresh, is_new
-        except SQLAlchemyError as e:
-            logger.error(f"Ошибка БД при входе/регистрации {phone}: {e}")
-            raise HTTPException(
-                status.HTTP_500_INTERNAL_SERVER_ERROR, "Ошибка авторизации"
-            ) from e
 
-    async def refresh_tokens(
-        self, refresh_token: str, request: Request
-    ) -> tuple[str, str]:
-        """Обновление токенов с проверкой сессии в Redis."""
+            # Фронтенд получит is_new=true только для абсолютно новых
+            return access, refresh, is_new
+
+        except Exception as e:
+            await self.db.rollback()
+            if isinstance(e, HTTPException):
+                raise e
+            logger.error(f"Ошибка входа {phone}: {e}")
+            raise HTTPException(500, "Ошибка авторизации") from e
+
+    async def refresh_tokens(self, refresh_token: str, request: Request) -> tuple[str, str, bool]:
         try:
             payload = jwt.decode(refresh_token, SECRET_KEY, [ALGORITHM])
             user_id, session_id = payload.get("id"), payload.get("jti")
-            redis_key = f"refresh:{user_id}:{session_id}"
 
-            stored = await self.redis.get(redis_key)
-            if not stored or json.loads(stored).get("refresh_token") != refresh_token:
-                logger.warning(f"Невалидный Refresh токен для User {user_id}")
+            if payload.get("type") != "refresh":
                 raise credentials_exception
 
-            user = await self.get_user_by_id(user_id)
-            if user.is_banned:
-                await self.redis.delete(redis_key)
-                logger.critical(f"Сессия прервана: User {user_id} забанен.")
-                raise HTTPException(403, "Заблокировано")
+            # 1. Grace Period (Льготный период для повторных запросов)
+            grace_data = await self._get_grace_session(user_id, session_id)
+            if grace_data:
+                return grace_data
 
-            await self.redis.delete(redis_key)
-            device, ip = get_session_info(request)
-            access, new_refresh = await create_tokens(user, device, ip, self.redis)
+            # 2. Валидация сессии и пользователя (Reuse Detection внутри)
+            user = await self.validate_user_access(user_id, session_id)
 
-            logger.info(f"Сессия обновлена: User {user_id}")
-            return access, new_refresh
-        except JWTError as e:
-            logger.error(f"JWT Error при Refresh: {e}")
-            raise credentials_exception from e
+            # 3. Ротация (Удаляем старую, создаем новую)
+            return await self._rotate_session(user, session_id, request)
 
-    async def set_user_role(
-        self, current_user: dict, target_id: int, role: UserRole
-    ) -> User:
-        if not current_user.get("is_admin"):
-            logger.warning(
-                f"Пользователь {current_user.get('id')} пытался сменить роль без прав"
-            )
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Нет прав администратора")
+        except JWTError:
+            raise credentials_exception from None
 
-        user = await self.get_user_by_id(target_id)
+    # --- ВСПОМОГАТЕЛЬНЫЕ ПРИВАТНЫЕ МЕТОДЫ (Clean Code) ---
 
-        # Обнуляем спец. роли (логика переключения)
-        user.is_supplier = False
-        user.is_trip_guide = False
-        user.is_customer = False
+    async def _get_grace_session(self, user_id: int, session_id: str) -> tuple | None:
+        data_raw = await self.redis.get(f"grace_period:{user_id}:{session_id}")
+        if data_raw:
+            d = json.loads(data_raw)
+            return d["access"], d["refresh"], d["is_new"]
+        return None
 
-        if role == UserRole.SUPPLIER:
-            user.is_supplier = True
-        elif role == UserRole.TRIP_GUIDE:
-            user.is_trip_guide = True
-        elif role == UserRole.CUSTOMER:
-            user.is_customer = True
-        else:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Неверная роль")
+    async def _rotate_session(self, user: User, old_sid: str, request: Request) -> tuple:
+        device, ip = get_session_info(request)
+        access, refresh = await create_tokens(user, device, ip, self.redis)
+        is_new = not bool(user.first_name)
 
-        try:
-            await self.db.commit()
-            # Сбрасываем сессии, чтобы новые роли записались в JWT при следующем входе
-            await self.logout_all({"id": target_id})
-            logger.info(
-                f"Админ {current_user['id']} установил роль {role} "
-                f"пользователю {target_id}"
-            )
-            return user
-        except SQLAlchemyError as e:
-            await self.db.rollback()
-            logger.error(f"Ошибка БД при смене роли для {target_id}: {e}")
-            raise HTTPException(
-                status.HTTP_500_INTERNAL_SERVER_ERROR, "Не удалось сохранить роль"
-            ) from e
+        # Сохраняем для Grace Period
+        grace_data = {"access": access, "refresh": refresh, "is_new": is_new}
+        await self.redis.set(f"grace_period:{user.id}:{old_sid}", json.dumps(grace_data), ex=60)
 
-    async def toggle_user_ban(self, current_user: dict, target_id: int) -> bool:
-        if not current_user.get("is_admin"):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Нет прав")
+        await self.logout(user.id, old_sid)
+        return access, refresh, is_new
 
-        user = await self.get_user_by_id(target_id)
-        if user.is_admin:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "Администратора нельзя забанить"
-            )
+    async def _check_otp_limits(self, phone: str, ip: str) -> None:
+        """Проверка лимитов на создание OTP (Highload-оптимизация)."""
+        # Используем MGET для экономии ресурсов (1 запрос вместо 2)
+        phone_limit, ip_limit = await self.redis.mget(f"limit:otp_req_phone:{phone}", f"limit:otp_req_ip:{ip}")
 
-        user.is_banned = not user.is_banned
+        if phone_limit or ip_limit:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Слишком много попыток")
 
-        try:
-            await self.db.commit()
-            # При смене статуса бана (особенно при блокировке) всегда сбрасываем сессии
-            await self.logout_all({"id": target_id})
+        daily_count = await self.redis.get(f"limit:otp_daily:{phone}")
+        if daily_count and int(daily_count) >= 10:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Дневной лимит исчерпан")
 
-            status_str = "забанен" if user.is_banned else "разбанен"
-            logger.info(
-                f"Админ {current_user['id']} изменил статус: "
-                f"пользователь {target_id} {status_str}"
-            )
-            return user.is_banned
-        except SQLAlchemyError as e:
-            await self.db.rollback()
-            logger.error(f"Ошибка БД при изменении бана для {target_id}: {e}")
-            raise HTTPException(
-                status.HTTP_500_INTERNAL_SERVER_ERROR,
-                "Ошибка обновления статуса блокировки",
-            ) from e
+    async def verify_otp_code(self, phone: str, code: str) -> None:
+        """Проверка кода с защитой от перебора (Brute-force)."""
+        retry_key = f"limit:otp_retry:{phone}"
 
-    async def list_sessions(self, current_user: dict) -> list[dict[str, Any]]:
-        """Безопасный список сессий через SCAN."""
-        user_id, current_jti = current_user["id"], current_user["jti"]
+        # 1. Проверяем, не заблокирован ли юзер за перебор
+        retries = await self.redis.get(retry_key)
+        if retries and int(retries) >= 5:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Много попыток. Бан 15 минут.")
+
+        # 2. Сверяем код
+        stored_otp = await self.redis.get(f"otp:{phone}")
+
+        if not stored_otp or not secrets.compare_digest(stored_otp, code):
+            # Увеличиваем счетчик ошибок
+            new_retries = await self.redis.incr(retry_key)
+            if int(new_retries) == 1:
+                await self.redis.expire(retry_key, 900)  # Бан 15 минут
+
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Неверный код")
+
+        # 3. Успех — чистим лимиты
+        await self.redis.delete(retry_key)
+        await self.redis.delete(f"otp:{phone}")
+
+    async def list_sessions(self, user: User, current_session_id: str) -> list[dict]:
+        # 1. Получаем все активные SID пользователя из нашего ZSET
+        sids = await self.redis.zrange(f"user_sessions:{user.id}", 0, -1)
+        if not sids:
+            return []
+
+        # 2. Собираем ключи для MGET
+        keys = [f"refresh:{user.id}:{sid}" for sid in sids]
+        data_list = await self.redis.mget(*keys)
+
         sessions = []
-        async for key in self.redis.scan_iter(match=f"refresh:{user_id}:*"):
-            data_raw = await self.redis.get(key)
-            if data_raw:
-                data = json.loads(data_raw)
-                session_id = key.split(":")[-1]
-                sessions.append(
-                    {
-                        "session_id": session_id,
-                        "device": data["device"],
-                        "ip": data["ip"],
-                        "is_current": session_id == current_jti,
-                    }
-                )
-        return sessions
+        for sid, data_raw in zip(sids, data_list, strict=True):
+            if not data_raw:
+                continue
 
-    async def logout(self, current_user: dict) -> None:
-        """Выход с текущего устройства."""
-        u_id, s_id = current_user["id"], current_user["jti"]
-        await self.redis.delete(f"refresh:{u_id}:{s_id}")
-        logger.info(f"User {u_id} вышел (сессия {s_id})")
-
-    async def logout_all(self, current_user: dict) -> None:
-        """Сброс всех сессий пользователя."""
-        user_id = current_user["id"]
-        keys = [key async for key in self.redis.scan_iter(match=f"refresh:{user_id}:*")]
-        if keys:
-            await self.redis.delete(*keys)
-        logger.info(f"Все сессии User {user_id} аннулированы ({len(keys)} шт.)")
-
-    # --- АДМИН ПАНЕЛЬ ---
-
-    async def admin_change_phone(
-        self, current_user: dict, target_user_id: int, new_phone: str
-    ) -> None:
-        """Смена номера (только админ) с инвалидацией сессий."""
-        if not current_user.get("is_admin"):
-            logger.warning(
-                f"User {current_user['id']} пытался выполнить админ-действие!"
+            data = json.loads(data_raw)
+            sessions.append(
+                {
+                    "session_id": sid,
+                    "device": data.get("device", "Unknown Device"),
+                    "ip": data.get("ip", "Unknown IP"),
+                    "is_current": sid == current_session_id,
+                    "created_at": data.get("created_at"),
+                }
             )
-            raise HTTPException(403, "Нет прав")
 
-        if await self.users.get_by_phone(new_phone):
-            raise HTTPException(400, "Номер занят")
+        return sorted(sessions, key=lambda x: (x["is_current"], x["created_at"]), reverse=True)
 
-        await self.users.change_phone(target_user_id, new_phone)
+    async def logout(self, user_id: int, session_id: str) -> None:
+        # Удаляем и данные, и индекс, и grace period
+        await self.redis.delete(f"refresh:{user_id}:{session_id}")
+        await self.redis.delete(f"grace_period:{user_id}:{session_id}")
+        await self.redis.zrem(f"user_sessions:{user_id}", session_id)
 
-        # Инвалидация сессий цели
-        keys = [
-            key
-            async for key in self.redis.scan_iter(match=f"refresh:{target_user_id}:*")
-        ]
-        if keys:
-            await self.redis.delete(*keys)
-        logger.info(
-            f"Админ {current_user['id']} изменил номер User {target_user_id}. "
-            "Сессии сброшены."
-        )
+    async def logout_all(self, user_id: int) -> None:
+        """Полный логаут со всех устройств (Enterprise стандарт)."""
+        index_key = f"user_sessions:{user_id}"
 
-    async def delete_account(self, current_user: dict) -> None:
-        """Полное удаление пользователя."""
-        user_id = current_user["id"]
-        try:
-            await self.users.delete_user(user_id)
-            keys = [
-                key async for key in self.redis.scan_iter(match=f"refresh:{user_id}:*")
-            ]
-            if keys:
-                await self.redis.delete(*keys)
-            logger.warning(f"АККАУНТ УДАЛЕН: User {user_id}")
-        except SQLAlchemyError as e:
-            logger.error(f"Ошибка БД при удалении аккаунта {user_id}: {e}")
-            raise HTTPException(500, "Ошибка удаления") from e
+        # 1. Получаем все SID из индекса (Sorted Set)
+        sids = await self.redis.zrange(index_key, 0, -1)
+
+        if sids:
+            # Формируем список ключей для удаления данных самих сессий
+            keys_to_del = [f"refresh:{user_id}:{sid}" for sid in sids]
+
+            # Также добавляем в список на удаление все записи Grace Period для этих сессий
+            grace_keys = [f"grace_period:{user_id}:{sid}" for sid in sids]
+
+            # Удаляем всё пачкой (БД Redis это любит)
+            await self.redis.delete(*keys_to_del, *grace_keys, index_key)
+            logger.info(f"Все сессии пользователя {user_id} аннулированы ({len(sids)} шт.)")
+
+        # 2. Дополнительная зачистка (на случай старых сессий без индекса)
+        # В Highload проектах SCAN используют аккуратно, но здесь это хорошая страховка
+        async for key in self.redis.scan_iter(match=f"refresh:{user_id}:*"):
+            await self.redis.delete(key)

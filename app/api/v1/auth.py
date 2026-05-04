@@ -5,13 +5,14 @@ from fastapi import APIRouter, Depends, Request, status
 
 from app.config.settings import settings
 from app.core.dependencies.auth import get_auth_service
-from app.core.security import get_session_info
+
+# from app.core.security import get_session_info
+from app.core.jwt import get_session_info
 from app.schemas.auth import (
     AppConfigResponse,
     OTPRequest,
     OTPVerifyRequest,
     RefreshRequest,
-    TokenPairOnlyResponse,
     TokenPairResponse,
 )
 from app.services.auth_service import AuthService
@@ -35,8 +36,9 @@ async def get_app_config():
     return AppConfigResponse(
         min_required_version=settings.app.min_app_version,
         latest_version=settings.app.version,
-        contact_support="https://t.me",
-        update_url="https://google.com",
+        contact_support=settings.app.contact_support,
+        update_url=settings.app.update_url,
+        maintenance_mode=settings.app.maintenance_mode,
     )
 
 
@@ -45,6 +47,10 @@ async def get_app_config():
     status_code=status.HTTP_200_OK,
     summary="Запрос кода подтверждения",
     description="Инициирует Flash Call на указанный номер телефона",
+    responses={
+        200: {"description": "Звонок заказан"},
+        429: {"description": "Слишком много запросов (лимит по IP или номеру)"},
+    },
 )
 async def request_otp(
     payload: OTPRequest,
@@ -62,6 +68,11 @@ async def request_otp(
     response_model=TokenPairResponse,
     summary="Проверка кода и вход",
     description="Обменивает OTP код на пару Access/Refresh токенов",
+    responses={
+        200: {"description": "Успешный вход"},
+        400: {"description": "Неверный код"},
+        429: {"description": "Бан на 15 минут за попытки подбора"},
+    },
 )
 async def verify_otp(
     payload: OTPVerifyRequest,
@@ -85,17 +96,21 @@ async def verify_otp(
 
 @router.post(
     "/refresh",
-    response_model=TokenPairOnlyResponse,
+    response_model=TokenPairResponse,
     summary="Обновление сессии",
     description="Выдает новый Access токен по валидному Refresh токену",
+    responses={
+        401: {"description": "Токен невалиден или сессия удалена"},
+        403: {"description": "Пользователь забанен"},
+    },
 )
 async def refresh_access_token(
     payload: RefreshRequest,
     request: Request,
     service: AuthServiceDep,
 ):
-    access, refresh = await service.refresh_tokens(
+    access, refresh, is_new = await service.refresh_tokens(
         refresh_token=payload.refresh_token,
         request=request,
     )
-    return TokenPairOnlyResponse(access_token=access, refresh_token=refresh)
+    return TokenPairResponse(access_token=access, refresh_token=refresh, is_new_user=is_new)

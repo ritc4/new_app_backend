@@ -12,7 +12,7 @@ class SQLAlchemyConfig(BaseModel):
 class DatabaseConfig(BaseModel):
     name: str = "app_db"
     user: str = "postgres"
-    password: SecretStr = SecretStr("12345")
+    password: SecretStr = SecretStr("")
     host: str = "localhost"
     port: int = 5432
 

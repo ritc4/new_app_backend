@@ -1,5 +1,6 @@
 from pydantic import BaseModel, SecretStr
 
+
 class RabbitMQConfig(BaseModel):
     host: str = "localhost"
     port: int = 5672

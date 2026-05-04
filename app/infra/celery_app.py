@@ -1,13 +1,10 @@
-from datetime import timedelta
-
 from celery import Celery
+from celery.schedules import crontab  # Импортируем для точного времени
 
 from app.config.settings import settings
 
-# 1. Список всех модулей с задачами (явно, как в больших проектах)
 CELERY_TASKS = [
     "app.workers.auth.tasks",
-    # "app.workers.payments.tasks",  # новые модули будете просто дописывать сюда
 ]
 
 celery_app = Celery(
@@ -19,18 +16,26 @@ celery_app = Celery(
 celery_app.conf.update(
     timezone=settings.celery.timezone,
     task_acks_late=settings.celery.task_acks_late,
+    # --- ENTERPRISE SETTINGS ---
+    # Переподключение при старте, если брокер недоступен
+    broker_connection_retry_on_startup=True,
+    # Ограничение: сколько задач воркер берет за раз (1 = по одной).
+    # Защищает от ситуации, когда один воркер захапал все тяжелые задачи.
+    worker_prefetch_multiplier=1,
 )
 
-# какая задача должна выполняться первой
+# Разделение по очередям
 celery_app.conf.task_routes = {
-    # Имя задачи : название очереди
     "send_flash_call": {"queue": "critical"},
     "cleanup_inactive_users_task": {"queue": "maintenance"},
 }
 
+# Расписание
 celery_app.conf.beat_schedule = {
-    "cleanup-daily-at-night": {
+    "cleanup-nightly": {
         "task": "cleanup_inactive_users_task",
-        "schedule": timedelta(hours=24),
+        # Запуск каждый день в 3:00 ночи
+        "schedule": crontab(hour=3, minute=0),
     },
 }
+ 
