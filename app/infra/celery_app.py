@@ -5,6 +5,7 @@ from app.config.settings import settings
 
 CELERY_TASKS = [
     "app.workers.auth.tasks",
+    "app.workers.users.tasks",
 ]
 
 celery_app = Celery(
@@ -38,4 +39,3 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour=3, minute=0),
     },
 }
- 

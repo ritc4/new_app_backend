@@ -18,17 +18,41 @@ async def get_user_service(
     s3_service: Annotated[S3Service, Depends(get_s3_service)],
     auth_service: Annotated[AuthService, Depends(get_auth_service)],
 ) -> UserService:
-    return UserService(db=db, s3=s3_service, auth_service=auth_service) 
+    return UserService(db=db, s3=s3_service, auth_service=auth_service)
 
 
 async def get_current_worker(user: Annotated[User, Depends(get_current_user)]) -> User:
     """
-    Проверяет, является ли пользователь персоналом (гид, водитель) или администратором.
-    Уровень 20+ включает в себя: supplier(20), trip_guide(20), admin(50), superuser(100).
+    Разрешает доступ СТРОГО воркеру (уровень 20).
+    Клиенты (10) и Админы (50+) получают отказ.
     """
-    if user.level < 20:
+    # Если уровень НЕ равен 20, значит это либо клиент, либо админ
+    if user.level != 20:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Доступ разрешен только для персонала и администраторов",
+            detail="Эта функция доступна только для водителей и гидов",
         )
+    return user
+
+
+async def get_current_customer(user: Annotated[User, Depends(get_current_user)]) -> User:
+    """
+    Разрешает редактирование ФИО только обычным клиентам (level 10).
+    Персонал (20+) и забаненные не проходят.
+    """
+    # Если уровень 20 и выше — это уже верифицированный персонал или админ
+    if user.level >= 20:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Верифицированные данные профиля можно изменить только через поддержку",
+        )
+
+    # Дополнительная страховка: если уровень меньше 10 (например, 0),
+    # возможно, это гость или неактивный юзер
+    if user.level < 10:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Доступ ограничен",
+        )
+
     return user

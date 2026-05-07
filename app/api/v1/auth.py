@@ -1,14 +1,13 @@
-import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Request
 
-from app.config.settings import settings
 from app.core.dependencies.auth import get_auth_service
 
 # from app.core.security import get_session_info
 from app.core.jwt import get_session_info
 from app.schemas.auth import (
+    ActionResponse,
     AppConfigResponse,
     OTPRequest,
     OTPVerifyRequest,
@@ -16,9 +15,6 @@ from app.schemas.auth import (
     TokenPairResponse,
 )
 from app.services.auth_service import AuthService
-
-# Создаем логгер для слоя API
-logger = logging.getLogger("app.api.auth")
 
 router = APIRouter()
 
@@ -28,89 +24,42 @@ AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 
 @router.get(
     "/config",
-    response_model=AppConfigResponse,
     summary="Конфигурация мобильного приложения",
-    description="Возвращает актуальные версии и ссылки для FlutterFlow",
+    description="Возвращает актуальные версии и ссылки",
+    response_model=AppConfigResponse,
 )
-async def get_app_config():
-    return AppConfigResponse(
-        min_required_version=settings.app.min_app_version,
-        latest_version=settings.app.version,
-        contact_support=settings.app.contact_support,
-        update_url=settings.app.update_url,
-        maintenance_mode=settings.app.maintenance_mode,
-    )
+async def get_app_config(service: AuthServiceDep):
+    # Теперь даже конфиг может отдавать сервис, чтобы в роутере не было логики settings
+    return await service.get_app_config()
 
 
 @router.post(
     "/request-otp",
-    status_code=status.HTTP_200_OK,
     summary="Запрос кода подтверждения",
     description="Инициирует Flash Call на указанный номер телефона",
-    responses={
-        200: {"description": "Звонок заказан"},
-        429: {"description": "Слишком много запросов (лимит по IP или номеру)"},
-    },
+    response_model=ActionResponse,
 )
-async def request_otp(
-    payload: OTPRequest,
-    request: Request,
-    service: AuthServiceDep,
-):
+async def request_otp(payload: OTPRequest, request: Request, service: AuthServiceDep):
     _, ip = get_session_info(request)
-    await service.request_otp(payload.phone, ip)
-    # Используем статус-коды FastAPI для чистоты кода
-    return {"status": "success", "message": "Звонок выполняется"}
+    return await service.request_otp(payload.phone, ip)
 
 
 @router.post(
     "/verify-otp",
-    response_model=TokenPairResponse,
     summary="Проверка кода и вход",
     description="Обменивает OTP код на пару Access/Refresh токенов",
-    responses={
-        200: {"description": "Успешный вход"},
-        400: {"description": "Неверный код"},
-        429: {"description": "Бан на 15 минут за попытки подбора"},
-    },
+    response_model=TokenPairResponse,
 )
-async def verify_otp(
-    payload: OTPVerifyRequest,
-    request: Request,
-    service: AuthServiceDep,
-):
-    # Координируем действия через сервис (Controller logic)
-    await service.verify_otp_code(payload.phone, payload.code)
-
-    access, refresh, is_new = await service.login_or_register(
-        phone=payload.phone,
-        request=request,
-    )
-
-    return TokenPairResponse(
-        access_token=access,
-        refresh_token=refresh,
-        is_new_user=is_new,
-    )
+async def verify_otp(payload: OTPVerifyRequest, request: Request, service: AuthServiceDep):
+    # Сервис сам проверит код и выполнит логин, вернув готовый TokenPairResponse
+    return await service.verify_otp_and_login(payload, request)
 
 
 @router.post(
     "/refresh",
-    response_model=TokenPairResponse,
     summary="Обновление сессии",
     description="Выдает новый Access токен по валидному Refresh токену",
-    responses={
-        401: {"description": "Токен невалиден или сессия удалена"},
-        403: {"description": "Пользователь забанен"},
-    },
+    response_model=TokenPairResponse,
 )
-async def refresh_access_token(
-    payload: RefreshRequest,
-    request: Request,
-    service: AuthServiceDep,
-):
-    access, refresh, is_new = await service.refresh_tokens(
-        refresh_token=payload.refresh_token,
-        request=request,
-    )
-    return TokenPairResponse(access_token=access, refresh_token=refresh, is_new_user=is_new)
+async def refresh_access_token(payload: RefreshRequest, request: Request, service: AuthServiceDep):
+    return await service.refresh_tokens(payload.refresh_token, request)

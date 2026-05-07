@@ -5,6 +5,7 @@ class RouteTag(StrEnum):
     AUTH = "Авторизация"
     USERS = "Профиль пользователя"
     ADMIN = "Управление доступом"
+    ONBOARDING = "Регистрация партнеров"
 
 
 tags_metadata = [
@@ -19,5 +20,9 @@ tags_metadata = [
     {
         "name": RouteTag.ADMIN,
         "description": "Админ-панель для управления ролями и блокировками пользователей.",
+    },
+    {
+        "name": RouteTag.ONBOARDING,
+        "description": "Регистрация  партнеров (водителей/гидов).",
     },
 ]

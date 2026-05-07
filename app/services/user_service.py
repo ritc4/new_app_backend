@@ -7,10 +7,20 @@ from fastapi import HTTPException, status
 from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config.settings import settings
 from app.models.user import User
+from app.repositories.onboarding_repository import OnboardingRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import CompleteRegistrationRequest
+from app.schemas.user import (
+    AdminSchema,
+    CustomerSchema,
+    FullProfileResponse,
+    SupplierSchema,
+    TripguideSchema,
+    UpdateProfileRequest,
+    UserRole,
+    UserShort,
+)
 from app.services.auth_service import AuthService
 from app.services.s3_service import S3Service
 
@@ -24,6 +34,7 @@ class UserService:
         self.s3 = s3
         self.auth = auth_service
         self.users = UserRepository(db)
+        self.onboarding = OnboardingRepository(db)
 
     async def complete_registration(self, user_id: int, data: CompleteRegistrationRequest) -> User:
         """Завершение регистрации с фиксацией транзакции."""
@@ -43,6 +54,28 @@ class UserService:
             logger.error(f"Ошибка регистрации User ID {user_id}: {e}")
             raise HTTPException(500, "Ошибка сохранения данных") from e
 
+    async def update_profile(self, user_id: int, data: UpdateProfileRequest) -> User:
+        """Обновление ФИО из настроек (как в Яндекс ID)."""
+        try:
+            # Извлекаем только те поля, которые юзер реально прислал из Flutter
+            update_data = data.model_dump(exclude_unset=True)
+
+            if not update_data:
+                raise HTTPException(400, "Нет данных для обновления")
+
+            # Вызываем твой универсальный метод репозитория
+            user = await self.users.update_user(user_id, **update_data)
+            await self.db.commit()
+
+            logger.info(f"User ID {user_id} обновил профиль в настройках: {list(update_data.keys())}")
+            return user
+        except Exception as e:
+            await self.db.rollback()
+            if isinstance(e, HTTPException):
+                raise e
+            logger.error(f"Ошибка обновления настроек профиля {user_id}: {e}")
+            raise HTTPException(500, "Ошибка при сохранении профиля") from e
+
     async def update_username(self, user_id: int, username: str) -> User:
         """Обновление ника с проверкой уникальности."""
         try:
@@ -59,6 +92,34 @@ class UserService:
             if isinstance(e, HTTPException):
                 raise e
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Ошибка обновления ника") from e
+
+    async def update_email(self, user_id: int, new_email: str) -> User:
+        """Смена почты с обязательным сбросом верификации (Standard Яндекс)."""
+        try:
+            # 1. Проверка уникальности
+            existing_user = await self.users.get_by_email(new_email)
+            if existing_user and existing_user.id != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail="Этот Email уже используется другим пользователем"
+                )
+
+            # 2. Атомарное обновление через репозиторий
+            user = await self.users.update_user(user_id=user_id, email=new_email, is_email_verified=False)
+
+            await self.db.commit()
+            logger.info(f"USER_EMAIL_CHANGED: ID {user_id} -> {new_email}. Status: Unverified.")
+            return user
+
+        except Exception as e:
+            await self.db.rollback()
+            # Пробрасываем HTTPException как есть (400 ошибка)
+            if isinstance(e, HTTPException):
+                raise e
+            # Все остальные ошибки превращаем в 500
+            logger.error(f"Ошибка обновления Email для User ID {user_id}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Ошибка при сохранении Email"
+            ) from e
 
     async def _delete_old_s3_object_safe(self, url: str):
         """Делегируем парсинг и удаление профильному сервису."""
@@ -80,23 +141,23 @@ class UserService:
         object_name = f"avatars/user_{user.id}/{uuid.uuid4()}.{file_ext}"
 
         try:
-            # 1. Данные для POST загрузки
-            presigned_data = await self.s3.get_upload_params(object_name, content_type)
+            # 1. Получаем данные от S3 (там уже есть и параметры загрузки, и готовый URL)
+            s3_res = await self.s3.get_upload_params(object_name, content_type)
 
-            # 2. Формируем финальный публичный URL
-            base_url = settings.s3.endpoint_url.rstrip("/")
-            final_url = f"{base_url}/{settings.s3.bucket_name}/{object_name}"
+            # Достаем готовые значения из словаря
+            upload_params = s3_res["upload_data"]
+            final_url = s3_res["public_url"]
 
-            # 3. Обновляем БД
+            # 2. Обновляем БД (теперь используем final_url из S3Service)
             await self.users.update_user(user.id, photo_url=final_url)
             await self.db.commit()
 
-            # 4. Удаляем старый файл (только если URL был и БД успешно обновилась)
+            # 3. Удаляем старый файл
             if old_photo_url:
                 await self._delete_old_s3_object_safe(old_photo_url)
 
             return {
-                "upload_data": presigned_data,
+                "upload_data": upload_params,  # Соответствует вашей схеме
                 "photo_url": final_url,
             }
         except Exception as e:
@@ -106,31 +167,42 @@ class UserService:
                 raise e
             raise HTTPException(500, "Ошибка при подготовке загрузки") from e
 
-    async def delete_account(self, user: User) -> None:
-        """Мягкое удаление (Soft Delete) и сброс сессий."""
+    async def delete_account(self, user: User) -> dict:
+        """Мягкое удаление. Сохраняем ФИО и проф. роли, но сбрасываем админку."""
         try:
             if user.deleted_at:
-                return
+                return {"status": "success", "message": "Аккаунт уже ожидает удаления"}
 
-            # ИЗМЕНЕНИЕ: Используем репозиторий для согласованности слоев
+            # ЛОГИКА СМЕНЫ РОЛИ:
+            # Если уходящий — админ, принудительно ставим роль "customer".
+            # Если supplier или trip_guide — оставляем их роль как есть.
+            new_role = user.role
+            if user.role == UserRole.ADMIN:
+                new_role = UserRole.CUSTOMER
+
             await self.users.update_user(
                 user.id,
                 deleted_at=datetime.now(UTC),
                 is_active=False,
-                role="customer",  # Сбрасываем роль
-                is_superuser=False,  # Снимаем статус владельца
+                role=new_role.value if isinstance(new_role, UserRole) else new_role,
+                is_superuser=False,  # Суперюзер всегда снимается
             )
 
             await self.db.commit()
             await self.auth.logout_all(user.id)
 
-            logger.warning(f"Аккаунт User {user.id} помечен на удаление.")
+            logger.warning(f"USER_DELETION: ID {user.id} (бывшая роль: {user.role}) помещен в корзину.")
+
+            return {
+                "status": "success",
+                "message": "Аккаунт удален. У вас есть 30 дней для восстановления профиля при входе.",
+            }
         except Exception as e:
             await self.db.rollback()
             logger.error(f"Ошибка удаления аккаунта {user.id}: {e}")
             raise HTTPException(500, "Ошибка при удалении") from e
 
-    async def toggle_work_status(self, user: User) -> bool:
+    async def toggle_work_status(self, user: User) -> dict:
         """Переключает статус: доступен для заказов / занят (офлайн)."""
         # БИЗНЕС-ПРАВИЛО: Кнопка работает только для тех, у кого уровень доступа 20 (воркеры)
         # Админам (50) и Суперюзерам (100) тоже разрешаем для тестов
@@ -143,69 +215,126 @@ class UserService:
             await self.db.commit()
 
             logger.info(f"User {user.id} (role: {user.role}) изменил статус на: {new_status}")
-            return new_status
+            status_text = "На работе" if new_status else "Отдыхаю"
+            return {"status": "success", "message": f"Ваш статус изменен на: {status_text}"}
         except Exception as e:
             await self.db.rollback()
             logger.error(f"Ошибка переключения статуса User {user.id}: {e}")
             raise HTTPException(500, "Ошибка обновления статуса") from e
 
     async def perform_full_cleanup(self) -> str:
-        """Массовая очистка заброшенных аккаунтов (Enterprise Highload стандарт)."""
+        """
+        Комплексная очистка системы (Enterprise стандарт):
+        1. Удаление старых временных анкет (Onboarding).
+        2. Удаление заброшенных и помеченных на удаление аккаунтов.
+        3. Очистка ресурсов (S3 + Redis) для удаляемых пользователей.
+        """
+        logger.info("CLEANUP_STARTED: Запуск плановой очистки системы...")
+        # --- ШАГ 1: Очистка старых анкет онбординга ---
+        # Используем локальный импорт во избежание циклической зависимости
+        from app.repositories.onboarding_repository import OnboardingRepository
 
+        onboarding_repo = OnboardingRepository(self.db)
+        deleted_apps_count = await onboarding_repo.delete_expired_applications()
+
+        # --- ШАГ 2: Поиск кандидатов на удаление аккаунта ---
         abandoned_date = datetime.now(UTC) - timedelta(days=180)
         soft_deleted_date = datetime.now(UTC) - timedelta(days=30)
 
-        # 1. Получаем список кандидатов
-        stmt = select(User.id, User.photo_url).where(
+        stmt = select(User.id).where(
             and_(
-                User.is_superuser.is_(False),  # ГЛАВНОЕ УСЛОВИЕ: только не суперюзеры
+                User.is_superuser.is_(False),  # Никогда не удаляем суперюзеров
                 or_(
-                    # Условие для заброшенных (недореганных)
+                    # Условие для недореганных (брошенных на старте)
                     (User.first_name.is_(None) & (User.last_active < abandoned_date)),
-                    # Условие для тех, кто сам нажал "Удалить аккаунт"
+                    # Условие для тех, кто сам нажал "Удалить"
                     (User.deleted_at.is_not(None) & (User.deleted_at < soft_deleted_date)),
                 ),
             )
         )
 
         res = await self.db.execute(stmt)
-        users_to_purge = res.all()
+        users_to_purge = res.scalars().all()
 
-        if not users_to_purge:
-            return "Удалено: 0"
+        # Если чистить нечего — выходим быстро
+        if not users_to_purge and deleted_apps_count == 0:
+            logger.info("CLEANUP_SKIPPED: Нет данных для удаления.")
+            return "Очистка завершена: новых данных для удаления нет."
 
         total_users = len(users_to_purge)
         batch_size = 100
         purged_ids = []
 
-        # 2. Оптимизация: Открываем ОДИН клиент S3 на весь процесс очистки
-        # Это позволяет использовать одно TCP-соединение (Keep-Alive) для всех удалений
+        # --- ШАГ 3: Очистка внешних ресурсов (S3 + Redis) ---
+        # Используем один S3 клиент (Keep-Alive) для всей пачки
         async with self.s3.session.client("s3", config=self.s3.s3_config, **self.s3.client_kwargs) as s3_client:
             for i in range(0, total_users, batch_size):
                 batch = users_to_purge[i : i + batch_size]
 
-                # Прокидываем s3_client в каждую задачу пачки
-                cleanup_tasks = [self._purge_resources_by_data(u.id, u.photo_url, s3_client) for u in batch]
-                await asyncio.gather(*cleanup_tasks)
+                # Запускаем задачи очистки для текущего батча
+                cleanup_tasks = [self._purge_resources_by_data(user_id, s3_client) for user_id in batch]
+                # return_exceptions=True чтобы ошибка одного юзера не остановила весь процесс
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
-                purged_ids.extend([u.id for u in batch])
+                purged_ids.extend(batch)
 
-        # 3. Bulk Delete
+        # --- ШАГ 4: Окончательное удаление из БД ---
         if purged_ids:
-            bulk_del_stmt = delete(User).where(User.id.in_(purged_ids))
-            await self.db.execute(bulk_del_stmt)
-            await self.db.commit()
+            # Каскадное удаление (ondelete="CASCADE") само очистит связанные профили
+            await self.db.execute(delete(User).where(User.id.in_(purged_ids)))
 
-        return f"Окончательно очищено пользователей: {len(purged_ids)}"
+        # Фиксируем все изменения (и анкеты, и пользователей)
+        await self.db.commit()
 
-    async def _purge_resources_by_data(self, user_id: int, photo_url: str | None, s3_client):
-        """Очистка ресурсов с переиспользованием S3 клиента."""
-        # 1. Сброс сессий в Redis
-        tasks = [self.auth.logout_all(user_id)]
+        report = f"Удалено анкет: {deleted_apps_count}, удалено пользователей: {len(purged_ids)}"
+        logger.info(f"FULL_CLEANUP_SUCCESS: {report}")
+        return report
 
-        # 2. Удаление фото из S3 (если есть) через общий клиент
-        if photo_url:
-            tasks.append(self.s3.delete_file_by_url(photo_url, client=s3_client))
+    async def _purge_resources_by_data(self, user_id: int, s3_client):
+        """Очистка всех ресурсов пользователя (Redis + ВСЕ файлы S3)."""
+        # 1. Инвалидация всех сессий в Redis
+        # 2. Удаление всех файлов из S3, где в пути есть 'user_{id}/'
+        tasks = [self.auth.logout_all(user_id), self.s3.delete_all_user_files(user_id, client=s3_client)]
 
-        # return_exceptions=True важен, чтобы ошибка одного юзера не прервала всю пачку
+        # return_exceptions=True гарантирует, что если у юзера не было файлов в S3,
+        # процесс не прервется ошибкой.
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def get_full_profile(self, user: User) -> FullProfileResponse:
+        """
+        Композиция профиля.
+        ВАЖНО: Предполагается, что связанные профили (supplier_profile и др.)
+        уже подгружены через selectinload или joinedload.
+        """
+        # 1. Базовая часть (маскировка сработает внутри pydantic валидатора)
+        user_base = UserShort.model_validate(user)
+        response = FullProfileResponse(user=user_base)
+
+        # 2. Логика по ролям
+        if user.role == UserRole.CUSTOMER:
+            # Заявки на онбординг обычно не подгружаются заранее, поэтому тут await
+            app = await self.onboarding.get_pending_by_user(user.id)
+            if app:
+                response.customer_data = CustomerSchema(
+                    onboarding_status=app.status,
+                    onboarding_error=app.admin_comment,
+                )
+
+        elif user.role == UserRole.ADMIN:
+            response.admin_data = AdminSchema(access_level=user.level)
+
+        elif user.role == UserRole.SUPPLIER:
+            # В асинхронной SQLAlchemy обращение к user.supplier_profile
+            # вызовет ошибку, если профиль не был подгружен заранее.
+            profile = user.supplier_profile
+            if profile:
+                response.supplier_data = SupplierSchema(
+                    rating=profile.rating, car_model=profile.car_model, car_number=profile.car_number
+                )
+
+        elif user.role == UserRole.TRIP_GUIDE:
+            profile = user.trip_guide_profile
+            if profile:
+                response.trip_guide_data = TripguideSchema(rating=profile.rating, languages=profile.languages or [])
+
+        return response

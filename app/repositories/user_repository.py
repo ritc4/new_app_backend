@@ -2,7 +2,7 @@ import logging
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, case, delete, select, update
+from sqlalchemy import and_, delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -39,7 +39,13 @@ class UserRepository:
         res = await self.db.execute(stmt)
         return res.scalar_one_or_none()
 
-    async def create_with_phone(self, phone: str, app_version: str) -> User:
+    async def get_by_email(self, email: str) -> User | None:
+        """Поиск по email среди активных (не удаленных) пользователей."""
+        stmt = select(User).where(and_(User.email == email, User.deleted_at.is_(None)))
+        res = await self.db.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def create_with_phone(self, phone: str, app_version: str, username: str) -> User:
         """
         Создает пользователя или восстанавливает удаленного.
         Сохраняет права активных админов при входе.
@@ -49,6 +55,8 @@ class UserRepository:
         # 1. Подготавливаем данные для нового пользователя
         stmt = pg_insert(User).values(
             phone=phone,
+            username=username,
+            is_email_verified=False,
             is_active=True,
             app_version=app_version,
             last_active=now,
@@ -59,15 +67,18 @@ class UserRepository:
         stmt = stmt.on_conflict_do_update(
             index_elements=["phone"],
             set_={
+                "username": User.username,
+                "first_name": User.first_name,
+                "last_name": User.last_name,
+                "middle_name": User.middle_name,
+                "email": User.email,
+                "photo_url": User.photo_url,
+                "is_email_verified": User.is_email_verified,
                 "is_active": True,
                 "app_version": app_version,
                 "last_active": now,
-                # Если юзер был удален (deleted_at не пустой) -> сбрасываем в customer.
-                # Если юзер просто входит (активный) -> оставляем текущую роль из БД.
-                "role": case((User.deleted_at.is_not(None), "customer"), else_=User.role),
-                # Аналогично для суперюзера: сброс только при восстановлении.
-                "is_superuser": case((User.deleted_at.is_not(None), False), else_=User.is_superuser),
-                # В самом конце очищаем метку удаления
+                "role": User.role,
+                "is_superuser": User.is_superuser,
                 "deleted_at": None,
             },
         ).returning(User)

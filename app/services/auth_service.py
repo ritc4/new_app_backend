@@ -1,6 +1,7 @@
 import json
 import logging
 import secrets
+import uuid
 
 from fastapi import HTTPException, Request, status
 from jose import JWTError, jwt
@@ -12,6 +13,7 @@ from app.core.exceptions import credentials_exception
 from app.core.jwt import ALGORITHM, SECRET_KEY, create_tokens, get_session_info
 from app.models.user import User
 from app.repositories.user_repository import UserRepository
+from app.schemas.auth import AppConfigResponse, OTPVerifyRequest
 
 logger = logging.getLogger("app.services.auth")
 
@@ -21,6 +23,27 @@ class AuthService:
         self.db = db
         self.redis = redis_client
         self.users = UserRepository(db)
+
+    async def get_app_config(self) -> AppConfigResponse:
+        """Для роутера /config"""
+        return AppConfigResponse(
+            min_required_version=settings.app.min_app_version,
+            latest_version=settings.app.version,
+            contact_support=settings.app.contact_support,
+            update_url=settings.app.update_url,
+            maintenance_mode=settings.app.maintenance_mode,
+        )
+
+    async def verify_otp_and_login(self, payload: OTPVerifyRequest, request: Request) -> dict:
+        """НОВЫЙ МЕТОД: Специально для чистого роутера /verify-otp"""
+        # 1. Сначала проверяем код (вызывает метод из Части 2)
+        await self.verify_otp_code(payload.phone, payload.code)
+
+        # 2. Затем логиним/регистрируем
+        access, refresh, is_new = await self.login_or_register(payload.phone, request)
+
+        # 3. Возвращаем структуру для TokenPairResponse
+        return {"access_token": access, "refresh_token": refresh, "is_new_user": is_new}
 
     # --- НОВОЕ: Методы для слоя безопасности (get_current_user) ---
 
@@ -58,9 +81,7 @@ class AuthService:
             await self.db.rollback()
             logger.error(f"Ошибка при обновлении активности пользователя {user_id}: {e}")
 
-    # --- ОСНОВНЫЕ МЕТОДЫ СЕРВИСА ---
-
-    async def request_otp(self, phone: str, ip: str) -> None:
+    async def request_otp(self, phone: str, ip: str) -> dict:
         # 1. Сначала проверяем, не на тех.обслуживании ли мы
         if settings.app.maintenance_mode:
             raise HTTPException(
@@ -68,74 +89,88 @@ class AuthService:
                 detail="Сервис временно недоступен. Ведутся технические работы.",
             )
 
+        # 1. Профессиональная проверка лимитов
         await self._check_otp_limits(phone, ip)
+
+        # Генерируем 4 цифры
         otp = "".join(str(secrets.randbelow(10)) for _ in range(4))
 
+        # Сохраняем OTP
         await self.redis.set(f"otp:{phone}", otp, ex=300)
+
+        # 2. Устанавливаем "флаг ожидания" (Wait limit)
+        # Чтобы нельзя было спамить чаще, чем раз в 60 секунд
         await self.redis.set(f"limit:otp_req_phone:{phone}", "1", ex=60)
         await self.redis.set(f"limit:otp_req_ip:{ip}", "1", ex=60)
 
-        # Инкрементируем дневной счетчик
+        # 3. Дневной лимит (чтобы не разорить бюджет на звонках)
         daily_key = f"limit:otp_daily:{phone}"
-        await self.redis.incr(daily_key)
-        await self.redis.expire(daily_key, 86400)
+        count = await self.redis.incr(daily_key)
+        if count == 1:
+            await self.redis.expire(daily_key, 86400)
+
+        if count > 5:  # Максимум 5 попыток в сутки на один номер
+            logger.warning(f"DAILY_LIMIT_EXCEEDED: {phone}")
+            raise HTTPException(429, "Лимит попыток на сегодня исчерпан. Попробуйте завтра.")
+
+        # 4. Отправка (запуск воркера)
         from app.workers.auth.tasks import send_flash_call_task
 
         send_flash_call_task.delay(phone, otp)
-        logger.info(f"Задача Flash Call для {phone} отправлена.")
+
+        logger.info(f"OTP_SENT: Phone={phone}, IP={ip}, Attempt={count}")
+        return {"status": "success", "message": "Звонок выполняется. Введите последние 4 цифры входящего номера."}
 
     async def login_or_register(self, phone: str, request: Request) -> tuple[str, str, bool]:
-        """
-        Вход или регистрация.
-        is_new=True только для тех, кого ВООБЩЕ нет в базе.
-        """
         if settings.app.maintenance_mode:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="Тех. обслуживание")
 
         try:
             app_version = request.headers.get("X-App-Version", "1.0.0")
+            device, ip = get_session_info(request)  # Перенесли выше для логов
 
-            # 1. Ищем пользователя, включая удаленных (Soft Delete)
+            # 1. Ищем пользователя (проверка на "возвращенца")
             existing_user = await self.users.get_by_phone_include_deleted(phone)
-
-            # ОПРЕДЕЛЯЕМ НОВИЗНУ:
-            # Если юзера нет в БД вообще — он НОВЫЙ.
-            # Если юзер есть (даже удаленный) — он СТАРЫЙ (возвращенец).
             is_new = not bool(existing_user)
 
-            # 2. Выполняем Upsert (Создание или Восстановление)
-            # Этот метод в репозитории сбросит deleted_at в None, если юзер был удален
-            user = await self.users.create_with_phone(phone, app_version)
+            # 2. Генерируем временный ник (Бизнес-логика теперь здесь!)
+            # 8 символов UUID достаточно для 4 млрд комбинаций
+            temp_username = f"user_{str(uuid.uuid4())[:8]}"
 
-            # 3. Проверка на бан (всегда важна)
+            # 2. Создание или Восстановление (Upsert)
+            user = await self.users.create_with_phone(phone, app_version, username=temp_username)
+
+            # 3. Проверка на бан
             if user.is_banned:
+                # В крупных компаниях при бане сессии не выдаются
+                logger.warning(f"BANNED_LOGIN_ATTEMPT: {phone} from {ip}")
                 raise HTTPException(status.HTTP_403_FORBIDDEN, "Аккаунт заблокирован")
 
             await self.db.commit()
 
-            # Логирование для аналитики
+            # ЛОГИРОВАНИЕ (Улучшено для аналитики)
+            log_meta = f"Phone: {phone}, IP: {ip}, Ver: {app_version}"
             if is_new:
-                logger.info(f"Новый пользователь: {phone}")
+                logger.info(f"USER_REGISTERED: {log_meta}")
             elif existing_user and existing_user.deleted_at:
-                logger.info(f"Пользователь ВОССТАНОВИЛСЯ после удаления: {phone}")
+                logger.info(f"USER_RESTORED: {log_meta}")
             else:
-                logger.info(f"Обычный вход: {phone}")
+                logger.info(f"USER_LOGIN: {log_meta}")
 
             # 4. Генерация токенов
-            device, ip = get_session_info(request)
             access, refresh = await create_tokens(user, device, ip, self.redis)
 
-            # Фронтенд получит is_new=true только для абсолютно новых
             return access, refresh, is_new
 
         except Exception as e:
             await self.db.rollback()
             if isinstance(e, HTTPException):
                 raise e
-            logger.error(f"Ошибка входа {phone}: {e}")
+            # В логах всегда указываем детали для отладки
+            logger.error(f"AUTH_CRITICAL_ERROR: {phone} - {str(e)}", exc_info=True)
             raise HTTPException(500, "Ошибка авторизации") from e
 
-    async def refresh_tokens(self, refresh_token: str, request: Request) -> tuple[str, str, bool]:
+    async def refresh_tokens(self, refresh_token: str, request: Request) -> dict:
         try:
             payload = jwt.decode(refresh_token, SECRET_KEY, [ALGORITHM])
             user_id, session_id = payload.get("id"), payload.get("jti")
@@ -146,7 +181,9 @@ class AuthService:
             # 1. Grace Period (Льготный период для повторных запросов)
             grace_data = await self._get_grace_session(user_id, session_id)
             if grace_data:
-                return grace_data
+                # Превращаем tuple из grace в dict для роутера
+                access, refresh, is_new = grace_data
+                return {"access_token": access, "refresh_token": refresh, "is_new_user": is_new}
 
             # 2. Валидация сессии и пользователя (Reuse Detection внутри)
             user = await self.validate_user_access(user_id, session_id)
@@ -166,7 +203,7 @@ class AuthService:
             return d["access"], d["refresh"], d["is_new"]
         return None
 
-    async def _rotate_session(self, user: User, old_sid: str, request: Request) -> tuple:
+    async def _rotate_session(self, user: User, old_sid: str, request: Request) -> dict:
         device, ip = get_session_info(request)
         access, refresh = await create_tokens(user, device, ip, self.redis)
         is_new = not bool(user.first_name)
@@ -176,7 +213,7 @@ class AuthService:
         await self.redis.set(f"grace_period:{user.id}:{old_sid}", json.dumps(grace_data), ex=60)
 
         await self.logout(user.id, old_sid)
-        return access, refresh, is_new
+        return {"access_token": access, "refresh_token": refresh, "is_new_user": is_new}
 
     async def _check_otp_limits(self, phone: str, ip: str) -> None:
         """Проверка лимитов на создание OTP (Highload-оптимизация)."""
@@ -242,13 +279,14 @@ class AuthService:
 
         return sorted(sessions, key=lambda x: (x["is_current"], x["created_at"]), reverse=True)
 
-    async def logout(self, user_id: int, session_id: str) -> None:
+    async def logout(self, user_id: int, session_id: str) -> dict:
         # Удаляем и данные, и индекс, и grace period
         await self.redis.delete(f"refresh:{user_id}:{session_id}")
         await self.redis.delete(f"grace_period:{user_id}:{session_id}")
         await self.redis.zrem(f"user_sessions:{user_id}", session_id)
+        return {"status": "success", "message": "Вы успешно вышли из системы"}
 
-    async def logout_all(self, user_id: int) -> None:
+    async def logout_all(self, user_id: int) -> dict:
         """Полный логаут со всех устройств (Enterprise стандарт)."""
         index_key = f"user_sessions:{user_id}"
 
@@ -270,3 +308,4 @@ class AuthService:
         # В Highload проектах SCAN используют аккуратно, но здесь это хорошая страховка
         async for key in self.redis.scan_iter(match=f"refresh:{user_id}:*"):
             await self.redis.delete(key)
+        return {"status": "success", "message": "Вы успешно вышли со всех устройств"}
