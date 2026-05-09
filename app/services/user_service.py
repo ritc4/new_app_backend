@@ -1,12 +1,12 @@
 import asyncio
 import logging
-import uuid
 from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException, status
 from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.storage import StoragePaths
 from app.models.user import User
 from app.repositories.onboarding_repository import OnboardingRepository
 from app.repositories.user_repository import UserRepository
@@ -131,33 +131,28 @@ class UserService:
             logger.error(f"Не удалось удалить старый аватар: {e}")
 
     async def update_avatar(self, user: User, content_type: str) -> dict:
-        """Подготовка к загрузке через Presigned POST."""
+        # Оставляем валидацию как была
         allowed_types = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
         if content_type not in allowed_types:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Недопустимый тип файла")
 
         old_photo_url = user.photo_url
-        file_ext = allowed_types[content_type]
-        object_name = f"avatars/user_{user.id}/{uuid.uuid4()}.{file_ext}"
+
+        # Генерация пути через core
+        object_name = StoragePaths.user_avatar(user.id, content_type)
 
         try:
-            # 1. Получаем данные от S3 (там уже есть и параметры загрузки, и готовый URL)
             s3_res = await self.s3.get_upload_params(object_name, content_type)
-
-            # Достаем готовые значения из словаря
-            upload_params = s3_res["upload_data"]
             final_url = s3_res["public_url"]
 
-            # 2. Обновляем БД (теперь используем final_url из S3Service)
             await self.users.update_user(user.id, photo_url=final_url)
             await self.db.commit()
 
-            # 3. Удаляем старый файл
             if old_photo_url:
                 await self._delete_old_s3_object_safe(old_photo_url)
 
             return {
-                "upload_data": upload_params,  # Соответствует вашей схеме
+                "upload_data": s3_res["upload_data"],
                 "photo_url": final_url,
             }
         except Exception as e:
@@ -303,16 +298,15 @@ class UserService:
     async def get_full_profile(self, user: User) -> FullProfileResponse:
         """
         Композиция профиля.
-        ВАЖНО: Предполагается, что связанные профили (supplier_profile и др.)
-        уже подгружены через selectinload или joinedload.
+        Предполагается, что связанные профили уже подгружены в объекте user.
         """
-        # 1. Базовая часть (маскировка сработает внутри pydantic валидатора)
+        # 1. Базовая часть юзера
         user_base = UserShort.model_validate(user)
         response = FullProfileResponse(user=user_base)
 
         # 2. Логика по ролям
         if user.role == UserRole.CUSTOMER:
-            # Заявки на онбординг обычно не подгружаются заранее, поэтому тут await
+            # Статус онбординга проверяем асинхронно, так как это отдельная таблица
             app = await self.onboarding.get_pending_by_user(user.id)
             if app:
                 response.customer_data = CustomerSchema(
@@ -320,21 +314,17 @@ class UserService:
                     onboarding_error=app.admin_comment,
                 )
 
-        elif user.role == UserRole.ADMIN:
-            response.admin_data = AdminSchema(access_level=user.level)
-
         elif user.role == UserRole.SUPPLIER:
-            # В асинхронной SQLAlchemy обращение к user.supplier_profile
-            # вызовет ошибку, если профиль не был подгружен заранее.
-            profile = user.supplier_profile
-            if profile:
-                response.supplier_data = SupplierSchema(
-                    rating=profile.rating, car_model=profile.car_model, car_number=profile.car_number
-                )
+            # Пользуемся тем, что профиль уже в памяти
+            if user.supplier_profile:
+                response.supplier_data = SupplierSchema.model_validate(user.supplier_profile)
 
         elif user.role == UserRole.TRIP_GUIDE:
-            profile = user.trip_guide_profile
-            if profile:
-                response.trip_guide_data = TripguideSchema(rating=profile.rating, languages=profile.languages or [])
+            # Пользуемся тем, что профиль уже в памяти
+            if user.trip_guide_profile:
+                response.trip_guide_data = TripguideSchema.model_validate(user.trip_guide_profile)
+
+        elif user.role == UserRole.ADMIN:
+            response.admin_data = AdminSchema(access_level=user.level)
 
         return response

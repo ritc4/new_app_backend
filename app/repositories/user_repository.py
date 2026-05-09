@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy import and_, delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from sqlalchemy.sql import func
 
 from app.models.user import User
@@ -20,17 +21,31 @@ class UserRepository:
 
     async def get_by_id(self, user_id: int) -> User | None:
         """Внутренний поиск по BigInt ID (для связей в БД)."""
-        return await self.db.get(User, user_id)
+        stmt = (
+            select(User)
+            .options(selectinload(User.supplier_profile), selectinload(User.trip_guide_profile))
+            .where(User.id == user_id)
+        )
+        res = await self.db.execute(stmt)
+        return res.scalar_one_or_none()
 
     async def get_by_uuid(self, user_uuid: UUID) -> User | None:
-        """Публичный поиск по UUID (для API и Flutter)."""
-        stmt = select(User).where(and_(User.uuid == user_uuid, User.deleted_at.is_(None)))
+        """Публичный поиск по UUID (для API и Flutter).""" 
+        stmt = (
+            select(User)
+            .options(selectinload(User.supplier_profile), selectinload(User.trip_guide_profile))
+            .where(and_(User.uuid == user_uuid, User.deleted_at.is_(None)))
+        )
         res = await self.db.execute(stmt)
         return res.scalar_one_or_none()
 
     async def get_by_phone(self, phone: str) -> User | None:
         """Поиск по телефону только среди активных (не удаленных)."""
-        stmt = select(User).where(and_(User.phone == phone, User.deleted_at.is_(None)))
+        stmt = (
+            select(User)
+            .options(selectinload(User.supplier_profile), selectinload(User.trip_guide_profile))
+            .where(and_(User.phone == phone, User.deleted_at.is_(None)))
+        )
         res = await self.db.execute(stmt)
         return res.scalar_one_or_none()
 
@@ -95,10 +110,14 @@ class UserRepository:
         if "last_active" not in values:
             values["last_active"] = func.now()
 
-        stmt = update(User).where(User.id == user_id).values(**values).returning(User)
+        stmt = (
+            update(User)
+            .where(User.id == user_id)
+            .values(**values)
+            .options(selectinload(User.supplier_profile), selectinload(User.trip_guide_profile))
+            .returning(User)
+        )
         res = await self.db.execute(stmt)
-
-        # ИСПРАВЛЕНИЕ: используем scalar_one_or_none() для безопасности
         return res.scalar_one_or_none()
 
     async def update_activity(self, user_id: int, app_version: str | None = None) -> None:

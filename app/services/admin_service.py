@@ -1,4 +1,6 @@
 import logging
+from collections.abc import Sequence
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -216,17 +218,35 @@ class AdminService:
             survey = app.survey_payload or {}  # Защита от None
 
             if app.target_role == UserRole.SUPPLIER:
-                # ВАЖНО: Убедитесь, что имена полей совпадает с тем, что мы писали в модели SupplierProfile
+                # Превращаем строку даты в объект date для БД
+                expiry_date = survey.get("license_expiry_date")
+                if isinstance(expiry_date, str):
+                    expiry_date = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+
                 new_profile = SupplierProfile(
                     user_id=app.user_id,
+                    # Авто данные
                     car_model=survey.get("car_model"),
+                    car_year=int(survey.get("car_year", 0)),
                     car_number=survey.get("car_number"),
-                    license_number=survey.get("license_number"),  # Добавил, если оно есть в анкете
+                    car_color=survey.get("car_color"),
+                    vin_number=survey.get("vin_number"),
+                    # Документы
+                    license_number=survey.get("license_number"),
+                    license_expiry_date=expiry_date,
+                    license_country=survey.get("license_country", "RU"),
                     experience_years=int(survey.get("experience_years", 0)),
+                    # Технические фото
+                    photo_selfie=survey.get("photo_selfie"),
                     photo_car_front=survey.get("photo_car_front"),
+                    photo_car_back=survey.get("photo_car_back"),
                     photo_sts_front=survey.get("photo_sts_front"),
+                    photo_sts_back=survey.get("photo_sts_back"),
+                    photo_license=survey.get("photo_license"),
                 )
                 self.db.add(new_profile)
+
+                await self.repo.update_user(app.user_id, photo_url=survey.get("photo_selfie"))
 
             elif app.target_role == UserRole.TRIP_GUIDE:
                 # Создаем запись в таблице гидов
@@ -254,22 +274,35 @@ class AdminService:
 
             # Теперь фиксируем всё одной транзакцией
             await self.db.commit()
-
+            updated_user = await self.repo.get_by_id(app.user_id)
+            if updated_user:
+                # Принудительно обновляем, чтобы SQLAlchemy увидела созданный профиль
+                await self.db.refresh(updated_user)
             logger.info(f"Админ {admin.id} одобрил партнера {app.user_id} ({app.target_role})")
-            return {"status": "success", "message": "Партнер успешно активирован и профиль создан"}
+            return {
+                "status": "success",
+                "message": "Партнер успешно активирован и профиль создан",
+                "user": updated_user,
+            }
 
         except Exception as e:
             await self.db.rollback()
             logger.error(f"Критическая ошибка активации {application_id}: {e}")
             raise HTTPException(500, "Ошибка при сохранении профиля") from e
 
-    async def reject_partner_application(self, admin: User, application_id: int, reason: str) -> dict:
+    async def reject_partner_application(self, admin: User, application_id: int, reason: str) -> dict[str, str]:
         """Отклонение заявки с указанием причины (Standard Яндекс)."""
         self._ensure_admin_access(admin)
 
+        clean_reason = reason.strip()
+        if not clean_reason:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Причина отклонения не может быть пустой")
+
         app = await self.onboarding.get_by_id(application_id)
+
+        # Проверяем статус: отклонить можно только то, что на модерации
         if not app or app.status != "on_moderation":
-            raise HTTPException(400, "Заявка не найдена или не находится на проверке")
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Заявка не найдена или не находится на проверке")
 
         try:
             # 1. Меняем статус и записываем причину
@@ -299,7 +332,7 @@ class AdminService:
 
     async def get_pending_applications(
         self, admin: User, limit: int = 20, offset: int = 0
-    ) -> list[OnboardingApplication]:
+    ) -> Sequence[OnboardingApplication]:
         """Получить очередь на модерацию."""
         self._ensure_admin_access(admin)
         return await self.onboarding.get_moderation_list(limit, offset)

@@ -8,7 +8,6 @@ from app.api.v1 import v1_router
 from app.config.settings import settings
 from app.core.openapi import tags_metadata
 from app.infra.db import engine
-from app.infra.httpx_client import httpx_client
 from app.infra.redis import redis_pool
 
 logger = logging.getLogger(__name__)
@@ -27,12 +26,6 @@ async def lifespan(app: FastAPI):
     # 1. Закрываем Redis
     await redis_pool.close()
     logger.info("Redis connection pool closed.")
-
-    # 2. Закрываем HTTP-клиент (чтобы оборвать keep-alive соединения с SigmaSMS и др.)
-    # Если в httpx_client.py ты создал синхронный клиент, используй .close()
-    # Если асинхронный — .aclose()
-    httpx_client.close()
-    logger.info("HTTPX client closed.")
 
     # 3. Закрываем движок SQLAlchemy
     # Это дождется завершения текущих транзакций и закроет пул соединений с Postgres

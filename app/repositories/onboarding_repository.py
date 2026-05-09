@@ -1,11 +1,13 @@
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.models.onboarding import OnboardingApplication
+from app.schemas.onboarding import OnboardingStatus
 
 
 class OnboardingRepository:
@@ -19,64 +21,93 @@ class OnboardingRepository:
         return res.scalar_one_or_none()
 
     async def create(self, **kwargs) -> OnboardingApplication:
-        """Создать новую запись заявки."""
-        new_app = OnboardingApplication(**kwargs)
-        self.db.add(new_app)
-        return new_app
+        """
+        Создает новую заявку или перезаписывает существующую (Upsert).
+        Явно затирает старые данные анкеты при перезапуске.
+        """
+        stmt = pg_insert(OnboardingApplication).values(**kwargs)
+
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["user_id"],
+            set_={
+                # Берем новые значения из переданных в VALUES
+                "target_role": stmt.excluded.target_role,
+                "bank_type": stmt.excluded.bank_type,
+                # Принудительно сбрасываем состояние
+                "status": OnboardingStatus.PENDING_LEGAL,
+                "survey_payload": None,
+                "inn": None,
+                "admin_comment": None,
+                "external_id": None,
+                "created_at": func.now(),
+            },
+        ).returning(OnboardingApplication)
+
+        res = await self.db.execute(stmt)
+        return res.scalar_one()
 
     async def update_by_user_id(self, user_id: int, **values) -> None:
         """Атомарное обновление заявки по ID пользователя."""
-        from sqlalchemy import update
 
         stmt = update(OnboardingApplication).where(OnboardingApplication.user_id == user_id).values(**values)
         await self.db.execute(stmt)
 
     async def get_pending_by_user(self, user_id: int) -> OnboardingApplication | None:
         """
-        Найти активную заявку пользователя.
-        Используется в /me для отображения статуса онбординга.
+        Находит заявку, которая находится В ПРОЦЕССЕ.
+        Отмененные (canceled), одобренные (approved) и отклоненные (rejected) - НЕ мешают.
         """
+        active_statuses = [
+            OnboardingStatus.PENDING_LEGAL,
+            OnboardingStatus.FILLING_SURVEY,
+            OnboardingStatus.ON_MODERATION,
+        ]
         stmt = select(OnboardingApplication).where(
-            OnboardingApplication.user_id == user_id,
-            OnboardingApplication.status != "approved",
+            OnboardingApplication.user_id == user_id, OnboardingApplication.status.in_(active_statuses)
         )
         res = await self.db.execute(stmt)
         return res.scalar_one_or_none()
 
     async def get_moderation_list(self, limit: int = 20, offset: int = 0) -> Sequence[OnboardingApplication]:
-        """
-        Список заявок для админ-панели.
-        joinedload гарантирует, что app.user будет доступен без доп. запросов.
-        """
         stmt = (
             select(OnboardingApplication)
             .options(joinedload(OnboardingApplication.user))
-            .where(OnboardingApplication.status == "on_moderation")
+            .where(OnboardingApplication.status == OnboardingStatus.ON_MODERATION)
             .order_by(OnboardingApplication.created_at.asc())
             .limit(limit)
             .offset(offset)
         )
         res = await self.db.execute(stmt)
-        # .scalars().all() возвращает Sequence, что идеально для типизации
         return res.scalars().all()
 
     async def delete_expired_applications(self) -> int:
-        """
-        Удаляет старые анкеты:
-        - Одобренные (approved): храним 180 дней для истории.
-        - Остальные: 30 дней.
-        """
-
         limit_approved = datetime.now(UTC) - timedelta(days=180)
         limit_others = datetime.now(UTC) - timedelta(days=30)
 
         stmt = delete(OnboardingApplication).where(
             or_(
-                # Старые одобренные
-                and_(OnboardingApplication.status == "approved", OnboardingApplication.created_at < limit_approved),
-                # Старый мусор (отклоненные, брошенные)
-                and_(OnboardingApplication.status != "approved", OnboardingApplication.created_at < limit_others),
+                and_(
+                    OnboardingApplication.status == OnboardingStatus.APPROVED,
+                    OnboardingApplication.created_at < limit_approved,
+                ),
+                and_(
+                    OnboardingApplication.status != OnboardingStatus.APPROVED,
+                    OnboardingApplication.created_at < limit_others,
+                ),
             )
         )
         result = await self.db.execute(stmt)
-        return result.rowcount  # Возвращаем кол-во удаленных записей
+        return result.rowcount
+
+    async def cancel_application(self, user_id: int) -> bool:
+        """Отмена пользователем только тех заявок, что не на модерации."""
+        stmt = (
+            update(OnboardingApplication)
+            .where(
+                OnboardingApplication.user_id == user_id,
+                OnboardingApplication.status.in_([OnboardingStatus.PENDING_LEGAL, OnboardingStatus.FILLING_SURVEY]),
+            )
+            .values(status=OnboardingStatus.CANCELED, admin_comment="Отменено пользователем")
+        )
+        result = await self.db.execute(stmt)
+        return result.rowcount > 0

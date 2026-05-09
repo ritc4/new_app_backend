@@ -10,7 +10,7 @@ class SQLAlchemyConfig(BaseModel):
 
 
 class DatabaseConfig(BaseModel):
-    name: str = "app_db"
+    name: str = "new_app_db"
     user: str = "postgres"
     password: SecretStr = SecretStr("")
     host: str = "localhost"

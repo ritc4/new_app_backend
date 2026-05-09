@@ -1,14 +1,19 @@
 import logging
-import uuid
 from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.storage import StoragePaths
 from app.repositories.onboarding_repository import OnboardingRepository
 from app.repositories.user_repository import UserRepository
-from app.schemas.onboarding import OnboardingStart, SupplierSurvey, TripguideSurvey
-from app.schemas.user import UserRole
+from app.schemas.onboarding import (
+    ROLE_ALLOWED_PHOTOS,
+    ROLE_SURVEY_SCHEMAS,
+    BankWebhookPayload,
+    OnboardingStart,
+    OnboardingStatus,
+)
 from app.services.s3_service import S3Service
 
 logger = logging.getLogger("app.services.onboarding")
@@ -28,111 +33,171 @@ class OnboardingService:
         self.onboarding = onboarding_repo
 
     async def create_application(self, user_id: int, data: OnboardingStart) -> dict[str, str]:
-        """Шаг 1: Создаем заявку через репозиторий и генерируем ссылку."""
+        """Шаг 0: Проверка и создание/Upsert заявки с очисткой старых данных."""
+
+        # 1. Ищем только АКТИВНЫЕ заявки (pending_legal, filling_survey, on_moderation)
+        # Если заявка canceled или rejected, этот метод вернет None
+        existing = await self.onboarding.get_pending_by_user(user_id)
+
+        if existing:
+            # Если роли не совпадают — блокируем (защита от чехарды)
+            if existing.target_role != data.target_role:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    f"У вас уже есть активная заявка на роль {existing.target_role}. "
+                    f"Отмените её, чтобы выбрать другую роль.",
+                )
+            # Если роли совпадают — просто отдаем старую ссылку
+            link = f"https://{existing.bank_type}.ru/bind?state=user_{user_id}"
+            return {"link": link}
+
+        # 2. Если активной заявки нет (она None или в архивном статусе)
         link = f"https://{data.bank}.ru/bind?state=user_{user_id}"
 
-        # Используем репозиторий вместо self.db.add
-        await self.onboarding.create(user_id=user_id, target_role=data.target_role, bank_type=data.bank)
+        # Вызываем метод репозитория (который делает on_conflict_do_update)
+        # Это принудительно обнулит survey_payload, inn и admin_comment
+        await self.onboarding.create(
+            user_id=user_id,
+            target_role=data.target_role,
+            bank_type=data.bank,
+            status=OnboardingStatus.PENDING_LEGAL,
+        )
 
         await self.db.commit()
-        logger.info("ЗАЯВКА_НА_ОНБОРДИНГ_СОЗДАНА: Пользователь ID %s", user_id)
+        logger.info("ОНБОРДИНГ_СТАРТ: Пользователь %s начал регистрацию как %s", user_id, data.target_role)
+
         return {"link": link}
 
-    async def process_bank_webhook(self, bank_payload: dict[str, Any]) -> dict[str, str]:
-        """Шаг 2: Верификация данных банка и обновление профиля."""
-        user_id = bank_payload["user_id"]
-        bank_phone = bank_payload["phone"]
-        inn = bank_payload["inn"]
-        full_name = bank_payload["full_name"]
+    async def process_bank_webhook(self, bank_payload: BankWebhookPayload) -> dict[str, str]:
+        """Шаг 1: Проверяем активную заявку и идемпотентность."""
+        user_id = bank_payload.user_id
+        app = await self.onboarding.get_pending_by_user(user_id)
 
+        if not app:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Активная заявка не найдена")
+
+        if app.status in [OnboardingStatus.FILLING_SURVEY, OnboardingStatus.ON_MODERATION, OnboardingStatus.REJECTED]:
+            logger.info("ВЕБХУК_ПОВТОР: Заявка %s уже в статусе %s", app.id, app.status)
+            return {"status": "ok", "message": "Already processed"}
+
+        """Шаг 2: Верификация данных банка."""
         user = await self.users.get_by_id(user_id)
         if not user:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
 
         # Проверка телефона
-        if user.phone != bank_phone:
+        if user.phone != bank_payload.phone:
             logger.warning(
-                "НЕСОВПАДЕНИЕ_ТЕЛЕФОНА: Пользователь %s (В приложении: %s, От банка: %s)",
-                user_id,
-                user.phone,
-                bank_phone,
+                "НЕСОВПАДЕНИЕ_ТЕЛЕФОНА: User %s (App: %s, Bank: %s)", user_id, user.phone, bank_payload.phone
             )
-
-            # Обновляем через репозиторий
+            # Отклоняем заявку и сразу фиксируем
             await self.onboarding.update_by_user_id(
-                user_id, status="rejected", admin_comment="Номер телефона в банке не совпадает с номером в приложении"
+                user_id,
+                status=OnboardingStatus.REJECTED,
+                admin_comment="Номер телефона в банке не совпадает с номером в приложении",
             )
             await self.db.commit()
-            logger.info("ЮРИДИЧЕСКИЙ_СТАТУС_ОТКЛОНЕН: Пользователь %s отклонен (телефоны не совпали).", user_id)
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Телефоны не совпадают")
 
-        # Обновляем ФИО в таблице пользователей
-        parts = full_name.split()
-        await self.users.update_user(
-            user_id,
-            last_name=parts[0] if len(parts) > 0 else None,
-            first_name=parts[1] if len(parts) > 1 else None,
-            middle_name=parts[2] if len(parts) > 2 else None,
-        )
+        """Шаг 3: Атомарное обновление профиля и заявки."""
+        try:
+            # Разбиваем имя
+            parts = [p for p in bank_payload.full_name.strip().split() if p]
 
-        # Переводим заявку на следующий этап через репозиторий
-        await self.onboarding.update_by_user_id(user_id, status="filling_survey", inn=inn)
+            # Обновляем обе таблицы в рамках одной транзакции
+            # 1. Данные пользователя
+            await self.users.update_user(
+                user_id,
+                last_name=parts[0] if len(parts) > 0 else user.last_name,
+                first_name=parts[1] if len(parts) > 1 else user.first_name,
+                middle_name=parts[2] if len(parts) > 2 else None,
+            )
 
-        await self.db.commit()
-        logger.info("Заявка обновлена для User ID %s", user_id)
+            # 2. Статус заявки и ИНН
+            await self.onboarding.update_by_user_id(
+                user_id, status=OnboardingStatus.FILLING_SURVEY, inn=bank_payload.inn
+            )
+
+            # Финальный коммит — если что-то упадет выше, ни одна таблица не изменится
+            await self.db.commit()
+            logger.info("Заявка и профиль успешно обновлены для User ID %s", user_id)
+
+        except Exception as e:
+            await self.db.rollback()
+            logger.error("ОШИБКА_ОБНОВЛЕНИЯ_ВЕБХУКА: User ID %s, Error: %s", user_id, e, exc_info=True)
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Ошибка при сохранении данных банка") from e
+
         return {"status": "ok"}
 
     async def submit_survey(self, user_id: int, survey_data: dict[str, Any]) -> dict[str, str]:
         """Шаг 3: Валидация анкеты и перевод на модерацию."""
-        # Используем твой метод get_pending_by_user из репозитория
         app = await self.onboarding.get_pending_by_user(user_id)
 
-        if not app or app.status != "filling_survey":
+        if not app or app.status != OnboardingStatus.FILLING_SURVEY:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Необходимо сначала пройти юридическую проверку")
 
-        # Валидация данных
-        try:
-            if app.target_role == UserRole.SUPPLIER:
-                SupplierSurvey(**survey_data)
-            elif app.target_role == UserRole.TRIP_GUIDE:
-                TripguideSurvey(**survey_data)
-        except Exception as e:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Ошибка в данных анкеты: {str(e)}") from e
+        # 1. Достаем нужный класс схемы по роли из БД
+        schema_class = ROLE_SURVEY_SCHEMAS.get(app.target_role)
+        if not schema_class:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Неизвестная роль: {app.target_role}")
 
-        # Сохраняем анкету через репозиторий
-        await self.onboarding.update_by_user_id(user_id, survey_payload=survey_data, status="on_moderation")
+        try:
+            # 2. Валидируем и дампим в JSON
+            validated_data = schema_class.model_validate(survey_data).model_dump(mode="json")
+        except Exception as e:
+            logger.error("ОШИБКА_ВАЛИДАЦИИ_АНКЕТЫ: User ID %s, Error: %s", user_id, e)
+            # Pydantic выбросит понятную ошибку, если, например, стаж < 3 лет
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Ошибка в данных анкеты: {str(e)}") from e
+
+        # Сохраняем через репозиторий
+        await self.onboarding.update_by_user_id(
+            user_id, survey_payload=validated_data, status=OnboardingStatus.ON_MODERATION
+        )
 
         await self.db.commit()
         logger.info("АНКЕТА_ОТПРАВЛЕНА: Пользователь ID %s переведен на модерацию.", user_id)
         return {"status": "success", "message": "Анкета успешно отправлена"}
 
     async def get_onboarding_upload_url(self, user_id: int, file_type: str, content_type: str) -> dict[str, Any]:
-        """
-        Генерирует ссылку для загрузки фото документов в S3 с проверкой типа.
-        file_type: 'car_front', 'sts', 'license' и т.д.
-        content_type: 'image/jpeg', 'image/png' и т.g.
-        """
-        # 1. Ограничение по типам файлов (как в аватаре)
+        app = await self.onboarding.get_pending_by_user(user_id)
+        if not app or app.status != OnboardingStatus.FILLING_SURVEY:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Загрузка недоступна")
+
+        if file_type not in ROLE_ALLOWED_PHOTOS.get(app.target_role, set()):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Тип файла '{file_type}' не предусмотрен")
+
+        # Ваша старая проверка типов
         allowed_types = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
         if content_type not in allowed_types:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, f"Недопустимый формат файла. Разрешены: {', '.join(allowed_types.keys())}"
-            )
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Недопустимый формат файла")
 
-        file_ext = allowed_types[content_type]
-        file_uuid = uuid.uuid4().hex
-        object_name = f"onboarding/user_{user_id}/{file_type}_{file_uuid}.{file_ext}"
+        # Используем StoragePaths только для генерации финальной строки
+        object_name = StoragePaths.onboarding_doc(user_id, file_type, content_type)
 
         try:
-            # 2. Получаем параметры из S3Service (там уже стоит лимит 5МБ в Conditions)
             s3_res = await self.s3.get_upload_params(object_name, content_type)
-
             return {
-                "upload_data": s3_res["upload_data"],  # Используем твой ключ
+                "upload_data": s3_res["upload_data"],
                 "file_url": s3_res["public_url"],
             }
         except Exception as e:
-            logger.error(f"Ошибка S3 при подготовке загрузки документа {file_type}: {e}")
-            raise HTTPException(
-                status.HTTP_500_INTERNAL_SERVER_ERROR, "Не удалось сгенерировать ссылку для загрузки"
-            ) from e
+            logger.error(f"Ошибка S3 при подготовке документа {file_type} для User {user_id}: {e}")
+            raise HTTPException(500, "Не удалось сгенерировать ссылку для загрузки") from e
+
+    async def cancel_current_application(self, user_id: int) -> dict[str, str]:
+        """Новый метод для отмены заявки пользователем."""
+        app = await self.onboarding.get_pending_by_user(user_id)
+
+        if not app:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Активная заявка не найдена")
+
+        # Если заявка на модерации, отменять уже нельзя
+        if app.status == OnboardingStatus.ON_MODERATION:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Заявка на проверке у администратора. Отмена невозможна.")
+
+        success = await self.onboarding.cancel_application(user_id)
+        if success:
+            await self.db.commit()
+            return {"status": "success", "message": "Заявка отменена"}
+
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Не удалось отменить заявку")

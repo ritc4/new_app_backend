@@ -6,9 +6,9 @@ app:
     level: "INFO"
     format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
   db:
-    user: "app_db_user"
-    name: "NEW_APP"
-    password: "app_db_pass"
+    user: "postgres"
+    name: "new_app_db"
+    password: "r12345ws"
     host: "localhost"
     port: "5432"
   http:

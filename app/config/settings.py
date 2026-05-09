@@ -13,7 +13,6 @@ from app.config.celery import CeleryConfig
 from app.config.database import DatabaseConfig
 from app.config.db_redis import RedisConfig
 from app.config.http import HttpConfig
-from app.config.httpx_client import HttpxClientConfig
 from app.config.log_config import LoggingConfig
 from app.config.rabbitmq import RabbitMQConfig
 from app.config.s3 import S3Config
@@ -45,7 +44,6 @@ class Settings(BaseSettings):
     rabbitmq: RabbitMQConfig = RabbitMQConfig()
     celery: CeleryConfig = CeleryConfig()
     sigma: SigmaConfig = SigmaConfig()
-    httpx_client: HttpxClientConfig = HttpxClientConfig()
     s3: S3Config = S3Config()
     http: HttpConfig = HttpConfig()
     logging: LoggingConfig = LoggingConfig()

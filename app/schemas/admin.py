@@ -21,7 +21,7 @@ class UserAdminView(UserShort):
 class AdminActionResponse(BaseModel):
     status: str = "success"
     message: str
-    user: UserAdminView
+    user: UserAdminView 
 
 
 class AdminChangePhoneRequest(BaseModel):

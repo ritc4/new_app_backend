@@ -1,11 +1,11 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from app.core.dependencies.onboarding import get_onboarding_service
 from app.core.security import get_current_user
 from app.models.user import User
-from app.schemas.onboarding import OnboardingStart
+from app.schemas.onboarding import BankWebhookPayload, OnboardingStart, SupplierSurvey, TripguideSurvey
 from app.services.onboarding_service import OnboardingService
 
 router = APIRouter()
@@ -21,22 +21,33 @@ async def start_onboarding(data: OnboardingStart, user: CurrentUserDep, service:
 
 
 @router.post("/webhook/bank", summary="Вебхук от банка")
-async def t_bank_webhook(data: dict, service: OnboardingServiceDep):
-    # Этот эндпоинт вызывает БАНК, а не юзер
-    return await service.process_bank_webhook(data)
+async def t_bank_webhook(
+    payload: BankWebhookPayload,
+    service: OnboardingServiceDep,
+):
+    return await service.process_bank_webhook(payload)
 
 
 @router.get("/upload-link", summary="Получить ссылку для загрузки")
 async def get_onboarding_link(
-    type: str,
-    content_type: str,
     user: CurrentUserDep,
     service: OnboardingServiceDep,
+    file_type: Annotated[str, Query(description="Тип документа (photo_selfie, и т.д.)")],
+    content_type: Annotated[str, Query(description="MIME-тип (image/jpeg, image/png)")],
 ):
-    return await service.get_onboarding_upload_url(user.id, type, content_type)
+    return await service.get_onboarding_upload_url(user.id, file_type, content_type)
 
 
 @router.post("/submit-survey", summary="Отправить анкету")
-async def submit_survey(data: dict, user: CurrentUserDep, service: OnboardingServiceDep):
-    # Вызывается из Flutter после возвращения из банка
-    return await service.submit_survey(user.id, data)
+async def submit_survey(
+    # Теперь в Swagger будет выбор между анкетой водителя и гида
+    data: SupplierSurvey | TripguideSurvey,
+    user: CurrentUserDep,
+    service: OnboardingServiceDep,
+):
+    return await service.submit_survey(user.id, data.model_dump())
+
+
+@router.delete("/cancel", summary="Отменить текущую заявку")
+async def cancel_onboarding(user: CurrentUserDep, service: OnboardingServiceDep):
+    return await service.cancel_current_application(user.id)

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from uuid import UUID
 
@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 class UpdateProfileRequest(BaseModel):
     """Схема для обновления профиля."""
+
     model_config = ConfigDict(str_strip_whitespace=True)
     first_name: str | None = Field(None, pattern=r"^[^\s].*[^\s]$", min_length=2, max_length=100, examples=["Иван"])
     last_name: str | None = Field(None, max_length=50, examples=["Иванов"])
@@ -96,35 +97,68 @@ class UserShort(BaseModel):
 
 class AdminSchema(BaseModel):
     """Данные только для админа."""
+
     model_config = ConfigDict(from_attributes=True)
     access_level: int = Field(..., description="Уровень в иерархии (50-100)")
 
 
 class CustomerSchema(BaseModel):
     """Данные только для клиента (пассажира/туриста)."""
+
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
     onboarding_status: str | None = Field(None, examples=["on_moderation"])
     onboarding_error: str | None = Field(None, alias="admin_comment")
 
 
 class SupplierSchema(BaseModel):
-    """Данные только для водителя."""
+    """
+    Публичный профиль водителя (Response DTO).
+    Валидаторы здесь не нужны, так как данные уже проверены при заполнении анкеты.
+    """
+
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
-    rating: float = Field(5.0)
-    car_model: str | None = None
-    car_number: str | None = None
+
+    rating: float = Field(default=5.0, examples=[4.95])
+
+    # Данные авто
+    car_model: str = Field(..., examples=["Tesla Model 3"])
+    car_year: int = Field(..., examples=[2022])
+    car_number: str = Field(..., examples=["А777АА77"])
+    car_color: str = Field(..., examples=["Белый"])
+    vin_number: str | None = Field(None, examples=["1YVHP8CB123456789"])
+
+    # Документы
+    license_number: str = Field(..., examples=["9901 123456"])
+    license_expiry_date: date = Field(...)
+    experience_years: int = Field(..., ge=0)
+
+    # Ссылки на фото (уже публичные URL из S3)
+    photo_selfie: str = Field(...)
+    photo_car_front: str = Field(...)
+    photo_car_back: str = Field(...)
+    photo_sts_front: str = Field(...)
+    photo_sts_back: str = Field(...)
+    photo_license: str = Field(...)
 
 
 class TripguideSchema(BaseModel):
     """Данные только для гида."""
+
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
     rating: float = Field(5.0)
     languages: list[str] = Field(default_factory=list, examples=[["RU", "EN"]])
+
+    # Добавляем недостающие поля, чтобы они не пропадали
+    bio: str | None = Field(None, max_length=1000)
+    specialization: str | None = Field(None, max_length=255)
+    photo_certificate: str | None = Field(None)
 
 
 # --- 3. НОВОЕ: Итоговая "Матрешка" для /me ---
 class FullProfileResponse(BaseModel):
     """Композитная схема профиля (Путь Яндекса)."""
+
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
     user: UserShort
 
