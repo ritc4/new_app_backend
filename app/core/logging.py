@@ -4,7 +4,7 @@ import sys
 from app.config.settings import settings
 
 
-def setup_logging():
+def setup_logging() -> None:
     """Настройка логирования для всего проекта"""
 
     # Формат логов (берем из твоего LoggingConfig)
@@ -16,14 +16,14 @@ def setup_logging():
         level=log_level,
         format=log_format,
         handlers=[
-            logging.StreamHandler(sys.stdout)  # Логи в консоль (Docker их подхватит)
+            logging.StreamHandler(sys.stdout),  # Логи в консоль (Docker их подхватит)
         ],
     )
 
     # Настройка специфичных логгеров
     # Логи SQLAlchemy (выключаем лишний шум, если не DEBUG)
     logging.getLogger("sqlalchemy.engine").setLevel(
-        logging.INFO if settings.db.sqla.echo else logging.WARNING
+        logging.INFO if settings.db.sqla.echo else logging.WARNING,
     )
 
     # Логи Alembic

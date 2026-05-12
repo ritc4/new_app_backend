@@ -6,12 +6,12 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config.settings import settings
 from app.infra.db import Base
-from app.models.admin_log import AdminLog  # noqa: F401
-from app.models.onboarding import OnboardingApplication  # noqa: F401
+from app.models.admin_log import AdminLog
+from app.models.onboarding import OnboardingApplication
+from app.models.user import User
+from app.models.user_profiles import SupplierProfile, TripGuideProfile
 
-# Обязательно импортируем модели, чтобы alembic их видел
-from app.models.user import User  # noqa: F401
-from app.models.user_profiles import SupplierProfile, TripGuideProfile  # noqa: F401
+MODELS = (User, OnboardingApplication, AdminLog, SupplierProfile, TripGuideProfile)
 
 target_metadata = Base.metadata
 

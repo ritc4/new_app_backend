@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -24,8 +24,10 @@ class OnboardingApplication(Base):
     # Обязательные поля (без | None)
     target_role: Mapped[str] = mapped_column(String(20))  # supplier / trip_guide
     status: Mapped[str] = mapped_column(
-        String(20), server_default="pending_legal", default="pending_legal"
-    )  # pending_legal, filling_survey, on_moderation, approved
+        String(20),
+        server_default="pending_legal",
+        default="pending_legal",
+    )  # pending_legal, filling_survey, on_moderation, approved, canceled
 
     # Данные от банка (Optional)
     bank_type: Mapped[str | None] = mapped_column(String(20))  # sber / t_bank
@@ -35,7 +37,7 @@ class OnboardingApplication(Base):
 
     # Анкета (СТС машины или навыки гида)
     # Используем dict | None для удобной работы с JSON-объектом
-    survey_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    survey_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

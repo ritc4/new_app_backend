@@ -22,6 +22,7 @@ class User(Base):
     """
 
     __tablename__ = "users"
+    __allow_unmapped__ = True
 
     # Основные поля
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, index=True)
@@ -41,7 +42,10 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String(255), unique=True, index=True)
 
     is_email_verified: Mapped[bool] = mapped_column(
-        Boolean, default=False, server_default="false", comment="Подтвержден ли email"
+        Boolean,
+        default=False,
+        server_default="false",
+        comment="Подтвержден ли email",
     )
     phone: Mapped[str] = mapped_column(String(20), unique=True, index=True)
     photo_url: Mapped[str | None] = mapped_column(String(500))
@@ -50,7 +54,10 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", comment="Доступ к приложению")
     is_available: Mapped[bool] = mapped_column(Boolean, default=True, comment="Доступность для заказов")
     is_superuser: Mapped[bool] = mapped_column(
-        Boolean, default=False, server_default="false", comment="Главный администратор"
+        Boolean,
+        default=False,
+        server_default="false",
+        comment="Главный администратор",
     )
     role: Mapped[str] = mapped_column(
         String(20),
@@ -63,7 +70,10 @@ class User(Base):
     # Безопасность и логи
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", comment="Заблокирован ли")
     last_active: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=func.now(), server_default=func.now(), index=True
+        DateTime(timezone=True),
+        default=func.now(),
+        server_default=func.now(),
+        index=True,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), server_default=func.now())
 
@@ -73,11 +83,16 @@ class User(Base):
     # Связи (Relationships)
     # Используем кавычки "SupplierProfile", чтобы не было ошибок импорта
     supplier_profile: Mapped[SupplierProfile | None] = relationship(
-        "SupplierProfile", back_populates="user", uselist=False
+        "SupplierProfile",
+        back_populates="user",
+        uselist=False,
     )
     trip_guide_profile: Mapped[TripGuideProfile | None] = relationship(
-        "TripGuideProfile", back_populates="user", uselist=False
+        "TripGuideProfile",
+        back_populates="user",
+        uselist=False,
     )
+    current_session_id: str | None = None
 
     @staticmethod
     def get_role_level(role: str, is_superuser: bool = False) -> int:

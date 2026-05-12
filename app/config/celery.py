@@ -9,4 +9,4 @@ class CeleryConfig(BaseModel):
     # Нужно ли хранить результаты задач
     result_backend: str | None = None
     # Подтверждение задачи только после выполнения (защита от сбоев)
-    task_acks_late: bool = True 
+    task_acks_late: bool = True

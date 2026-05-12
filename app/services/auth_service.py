@@ -1,4 +1,3 @@
-import json
 import logging
 import secrets
 import uuid
@@ -13,13 +12,24 @@ from app.core.exceptions import credentials_exception
 from app.core.jwt import ALGORITHM, SECRET_KEY, create_tokens, get_session_info
 from app.models.user import User
 from app.repositories.user_repository import UserRepository
-from app.schemas.auth import AppConfigResponse, OTPVerifyRequest
+from app.schemas.auth import (
+    AppConfigResponse,
+    AuthResult,
+    GraceSessionData,
+    LogoutAllResponse,
+    LogoutResponse,
+    OTPResponse,
+    OTPVerifyRequest,
+    SessionData,
+    SessionInfo,
+    TokenPairResponse,
+)
 
 logger = logging.getLogger("app.services.auth")
 
 
 class AuthService:
-    def __init__(self, db: AsyncSession, redis_client: Redis):
+    def __init__(self, db: AsyncSession, redis_client: "Redis[str]") -> None:
         self.db = db
         self.redis = redis_client
         self.users = UserRepository(db)
@@ -34,35 +44,105 @@ class AuthService:
             maintenance_mode=settings.app.maintenance_mode,
         )
 
-    async def verify_otp_and_login(self, payload: OTPVerifyRequest, request: Request) -> dict:
+    async def request_otp(self, phone: str, ip: str) -> OTPResponse:
+        if settings.app.maintenance_mode:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="Тех. обслуживание")
+
+        # 1. Сначала проверяем жесткие лимиты (Wait limit и Daily)
+        await self._check_otp_limits(phone, ip)
+
+        # 2. Генерируем и сохраняем OTP
+        otp = "".join(str(secrets.randbelow(10)) for _ in range(4))
+        await self.redis.set(f"otp:{phone}", otp, ex=300)
+
+        # 3. Устанавливаем лимиты ожидания и инкрементируем счетчик за день
+        # Используем pipeline или просто последовательно, но лимиты ставим ПОСЛЕ успеха генерации
+        await self.redis.set(f"limit:otp_req_phone:{phone}", "1", ex=60)
+        await self.redis.set(f"limit:otp_req_ip:{ip}", "1", ex=60)
+
+        daily_key = f"limit:otp_daily:{phone}"
+        await self.redis.incr(daily_key)
+        await self.redis.expire(daily_key, 86400, nx=True)  # Ставим expire только если ключа не было
+
+        from app.workers.auth.tasks import send_flash_call_task
+
+        send_flash_call_task.delay(phone, otp)
+
+        return OTPResponse(status="success", message="Звонок выполняется.")
+
+    async def verify_otp_and_login(self, payload: OTPVerifyRequest, request: Request) -> TokenPairResponse:
         """НОВЫЙ МЕТОД: Специально для чистого роутера /verify-otp"""
         # 1. Сначала проверяем код (вызывает метод из Части 2)
         await self.verify_otp_code(payload.phone, payload.code)
 
         # 2. Затем логиним/регистрируем
-        access, refresh, is_new = await self.login_or_register(payload.phone, request)
+        result = await self.login_or_register(payload.phone, request)
 
         # 3. Возвращаем структуру для TokenPairResponse
-        return {"access_token": access, "refresh_token": refresh, "is_new_user": is_new}
+        return TokenPairResponse(
+            access_token=result.access_token,
+            refresh_token=result.refresh_token,
+            is_new_user=result.is_new_user,
+        )
+
+    async def refresh_tokens(self, refresh_token: str, request: Request) -> TokenPairResponse:
+        try:
+            payload = jwt.decode(refresh_token, SECRET_KEY, [ALGORITHM])
+            user_id, session_id = payload.get("id"), payload.get("jti")
+            if not isinstance(user_id, int) or not isinstance(session_id, str):
+                raise credentials_exception
+
+            if payload.get("type") != "refresh":
+                raise credentials_exception
+
+            # 1. Grace Period (Льготный период для повторных запросов)
+            grace = await self._get_grace_session(user_id, session_id)
+            if grace:
+                return TokenPairResponse(
+                    access_token=grace.access,
+                    refresh_token=grace.refresh,
+                    is_new_user=grace.is_new,
+                )
+
+            # 2. Валидация сессии и пользователя (Reuse Detection внутри)
+            user = await self.validate_user_access(user_id, session_id)
+
+            # 3. Ротация (Удаляем старую, создаем новую)
+            return await self._rotate_session(user, session_id, request)
+
+        except JWTError:
+            raise credentials_exception from None
 
     # --- НОВОЕ: Методы для слоя безопасности (get_current_user) ---
 
     async def validate_user_access(self, user_id: int, session_id: str) -> User:
-        """Бизнес-логика проверки доступа (используется в get_current_user)."""
+        """Бизнес-логика проверки доступа (Яндекс-стайл)."""
+
         # 1. Валидация сессии в Redis
-        if not await self.redis.exists(f"refresh:{user_id}:{session_id}"):
+        # Важно: используем явную проверку существования ключа
+        session_exists = await self.redis.exists(f"refresh:{user_id}:{session_id}")
+        if not session_exists:
             raise credentials_exception
 
-        # 2. Получение и проверка статуса пользователя
+        # 2. Получение пользователя
         user = await self.users.get_by_id(user_id)
 
-        if not user or user.is_banned or user.deleted_at is not None or not user.is_active:
-            if user_id:
-                await self.logout(user_id, session_id)
+        # Сначала проверяем физическое существование (Type Guard для MyPy)
+        if not user:
+            await self.logout(user_id, session_id)
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Аккаунт удален")
 
-            if user and not user.is_active:
+        # Теперь MyPy на 100% знает, что user — это объект класса User
+        # 3. Проверка статусов (Бан, Удаление, Активность)
+        is_invalid = user.is_banned or user.deleted_at is not None or not user.is_active
+
+        if is_invalid:
+            await self.logout(user_id, session_id)
+
+            # Определяем детальную причину
+            if not user.is_active:
                 detail = "Аккаунт деактивирован"
-            elif user and user.is_banned:
+            elif user.is_banned:
                 detail = "Аккаунт заблокирован"
             else:
                 detail = "Аккаунт удален"
@@ -71,7 +151,7 @@ class AuthService:
 
         return user
 
-    async def update_user_activity_bg(self, user_id: int, app_version: str):
+    async def update_user_activity_bg(self, user_id: int, app_version: str) -> None:
         """Фоновая задача обновления активности."""
         try:
             await self.users.update_activity(user_id, app_version)
@@ -81,47 +161,7 @@ class AuthService:
             await self.db.rollback()
             logger.error(f"Ошибка при обновлении активности пользователя {user_id}: {e}")
 
-    async def request_otp(self, phone: str, ip: str) -> dict:
-        # 1. Сначала проверяем, не на тех.обслуживании ли мы
-        if settings.app.maintenance_mode:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Сервис временно недоступен. Ведутся технические работы.",
-            )
-
-        # 1. Профессиональная проверка лимитов
-        await self._check_otp_limits(phone, ip)
-
-        # Генерируем 4 цифры
-        otp = "".join(str(secrets.randbelow(10)) for _ in range(4))
-
-        # Сохраняем OTP
-        await self.redis.set(f"otp:{phone}", otp, ex=300)
-
-        # 2. Устанавливаем "флаг ожидания" (Wait limit)
-        # Чтобы нельзя было спамить чаще, чем раз в 60 секунд
-        await self.redis.set(f"limit:otp_req_phone:{phone}", "1", ex=60)
-        await self.redis.set(f"limit:otp_req_ip:{ip}", "1", ex=60)
-
-        # 3. Дневной лимит (чтобы не разорить бюджет на звонках)
-        daily_key = f"limit:otp_daily:{phone}"
-        count = await self.redis.incr(daily_key)
-        if count == 1:
-            await self.redis.expire(daily_key, 86400)
-
-        if count > 5:  # Максимум 5 попыток в сутки на один номер
-            logger.warning(f"DAILY_LIMIT_EXCEEDED: {phone}")
-            raise HTTPException(429, "Лимит попыток на сегодня исчерпан. Попробуйте завтра.")
-
-        # 4. Отправка (запуск воркера)
-        from app.workers.auth.tasks import send_flash_call_task
-
-        send_flash_call_task.delay(phone, otp)
-
-        logger.info(f"OTP_SENT: Phone={phone}, IP={ip}, Attempt={count}")
-        return {"status": "success", "message": "Звонок выполняется. Введите последние 4 цифры входящего номера."}
-
-    async def login_or_register(self, phone: str, request: Request) -> tuple[str, str, bool]:
+    async def login_or_register(self, phone: str, request: Request) -> AuthResult:
         if settings.app.maintenance_mode:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="Тех. обслуживание")
 
@@ -160,7 +200,7 @@ class AuthService:
             # 4. Генерация токенов
             access, refresh = await create_tokens(user, device, ip, self.redis)
 
-            return access, refresh, is_new
+            return AuthResult(access_token=access, refresh_token=refresh, is_new_user=is_new)
 
         except Exception as e:
             await self.db.rollback()
@@ -170,142 +210,169 @@ class AuthService:
             logger.error(f"AUTH_CRITICAL_ERROR: {phone} - {str(e)}", exc_info=True)
             raise HTTPException(500, "Ошибка авторизации") from e
 
-    async def refresh_tokens(self, refresh_token: str, request: Request) -> dict:
-        try:
-            payload = jwt.decode(refresh_token, SECRET_KEY, [ALGORITHM])
-            user_id, session_id = payload.get("id"), payload.get("jti")
-
-            if payload.get("type") != "refresh":
-                raise credentials_exception
-
-            # 1. Grace Period (Льготный период для повторных запросов)
-            grace_data = await self._get_grace_session(user_id, session_id)
-            if grace_data:
-                # Превращаем tuple из grace в dict для роутера
-                access, refresh, is_new = grace_data
-                return {"access_token": access, "refresh_token": refresh, "is_new_user": is_new}
-
-            # 2. Валидация сессии и пользователя (Reuse Detection внутри)
-            user = await self.validate_user_access(user_id, session_id)
-
-            # 3. Ротация (Удаляем старую, создаем новую)
-            return await self._rotate_session(user, session_id, request)
-
-        except JWTError:
-            raise credentials_exception from None
-
     # --- ВСПОМОГАТЕЛЬНЫЕ ПРИВАТНЫЕ МЕТОДЫ (Clean Code) ---
 
-    async def _get_grace_session(self, user_id: int, session_id: str) -> tuple | None:
+    async def _get_grace_session(self, user_id: int, session_id: str) -> GraceSessionData | None:
         data_raw = await self.redis.get(f"grace_period:{user_id}:{session_id}")
-        if data_raw:
-            d = json.loads(data_raw)
-            return d["access"], d["refresh"], d["is_new"]
-        return None
+        if not data_raw:
+            return None
 
-    async def _rotate_session(self, user: User, old_sid: str, request: Request) -> dict:
+        # ПРАВИЛЬНО: Парсим JSON сразу в схему. MyPy теперь знает типы полей.
+        return GraceSessionData.model_validate_json(data_raw)
+
+    async def _rotate_session(self, user: User, old_sid: str, request: Request) -> TokenPairResponse:
         device, ip = get_session_info(request)
         access, refresh = await create_tokens(user, device, ip, self.redis)
         is_new = not bool(user.first_name)
 
         # Сохраняем для Grace Period
-        grace_data = {"access": access, "refresh": refresh, "is_new": is_new}
-        await self.redis.set(f"grace_period:{user.id}:{old_sid}", json.dumps(grace_data), ex=60)
+        grace_data = GraceSessionData(access=access, refresh=refresh, is_new=is_new)
+        await self.redis.set(
+            f"grace_period:{user.id}:{old_sid}",
+            grace_data.model_dump_json(),  # Сериализуем красиво
+            ex=60,
+        )
 
         await self.logout(user.id, old_sid)
-        return {"access_token": access, "refresh_token": refresh, "is_new_user": is_new}
+        return TokenPairResponse(access_token=access, refresh_token=refresh, is_new_user=is_new)
 
     async def _check_otp_limits(self, phone: str, ip: str) -> None:
         """Проверка лимитов на создание OTP (Highload-оптимизация)."""
-        # Используем MGET для экономии ресурсов (1 запрос вместо 2)
-        phone_limit, ip_limit = await self.redis.mget(f"limit:otp_req_phone:{phone}", f"limit:otp_req_ip:{ip}")
 
-        if phone_limit or ip_limit:
-            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Слишком много попыток")
+        # 1. Явно типизируем результат MGET для MyPy
+        # redis.mget возвращает list[str | None]
+        limits: list[str | None] = await self.redis.mget(f"limit:otp_req_phone:{phone}", f"limit:otp_req_ip:{ip}")
 
-        daily_count = await self.redis.get(f"limit:otp_daily:{phone}")
-        if daily_count and int(daily_count) >= 10:
-            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Дневной лимит исчерпан")
+        # Распаковка (Type Safe)
+        phone_limit, ip_limit = limits[0], limits[1]
+
+        # 2. Проверка "Wait limit" (60 секунд между попытками)
+        if phone_limit is not None or ip_limit is not None:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Слишком много попыток. Пожалуйста, подождите минуту.",
+            )
+
+        # 3. Дневной лимит (макс 10 звонков в сутки)
+        daily_count_raw = await self.redis.get(f"limit:otp_daily:{phone}")
+
+        if daily_count_raw is not None:
+            # Превращаем в int только после проверки на None
+            if int(daily_count_raw) >= 10:
+                logger.warning(f"DAILY_LIMIT_EXCEEDED: {phone}")
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Дневной лимит попыток исчерпан",
+                )
 
     async def verify_otp_code(self, phone: str, code: str) -> None:
         """Проверка кода с защитой от перебора (Brute-force)."""
         retry_key = f"limit:otp_retry:{phone}"
 
-        # 1. Проверяем, не заблокирован ли юзер за перебор
-        retries = await self.redis.get(retry_key)
-        if retries and int(retries) >= 5:
-            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Много попыток. Бан 15 минут.")
+        # 1. Проверяем блокировку (Type Safe)
+        retries_raw = await self.redis.get(retry_key)
+        if retries_raw is not None:
+            # Сначала в int, потом сравниваем. Явная проверка на None для MyPy.
+            if int(retries_raw) >= 5:
+                logger.warning(f"BRUTE_FORCE_ATTEMPT: {phone}")
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Слишком много попыток. Доступ заблокирован на 15 минут.",
+                )
 
         # 2. Сверяем код
         stored_otp = await self.redis.get(f"otp:{phone}")
 
+        # secrets.compare_digest работает только со строками одинаковой длины или объектами bytes
+        # Поэтому сначала проверяем наличие и тип
         if not stored_otp or not secrets.compare_digest(stored_otp, code):
-            # Увеличиваем счетчик ошибок
-            new_retries = await self.redis.incr(retry_key)
-            if int(new_retries) == 1:
-                await self.redis.expire(retry_key, 900)  # Бан 15 минут
+            # Увеличиваем счетчик (incr возвращает int в асинхронном redis-py)
+            new_retries: int = await self.redis.incr(retry_key)
 
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Неверный код")
+            if new_retries == 1:
+                await self.redis.expire(retry_key, 900)
 
-        # 3. Успех — чистим лимиты
-        await self.redis.delete(retry_key)
-        await self.redis.delete(f"otp:{phone}")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Неверный код подтверждения")
 
-    async def list_sessions(self, user: User, current_session_id: str) -> list[dict]:
-        # 1. Получаем все активные SID пользователя из нашего ZSET
-        sids = await self.redis.zrange(f"user_sessions:{user.id}", 0, -1)
+        # 3. Успех — атомарная зачистка
+        await self.redis.delete(retry_key, f"otp:{phone}")
+        logger.info(f"OTP_VERIFIED: {phone}")
+
+    async def list_sessions(self, user: User, current_session_id: str | None) -> list[SessionInfo]:
+        if current_session_id is None:
+            raise HTTPException(status_code=401, detail="Сессия не найдена")
+
+        # 1. Получаем SID. Redis[str] возвращает list[str]
+        sids: list[str] = await self.redis.zrange(f"user_sessions:{user.id}", 0, -1)
         if not sids:
             return []
 
         # 2. Собираем ключи для MGET
         keys = [f"refresh:{user.id}:{sid}" for sid in sids]
-        data_list = await self.redis.mget(*keys)
 
-        sessions = []
+        # ПРАВИЛЬНО: Результат MGET — список строк или None
+        data_list: list[str | None] = await self.redis.mget(*keys)
+
+        sessions: list[SessionInfo] = []
+
+        # 3. Обработка через встроенный валидатор строк Pydantic
         for sid, data_raw in zip(sids, data_list, strict=True):
-            if not data_raw:
+            # Если данных в Redis нет (протухли), пропускаем
+            if data_raw is None:
                 continue
 
-            data = json.loads(data_raw)
-            sessions.append(
-                {
-                    "session_id": sid,
-                    "device": data.get("device", "Unknown Device"),
-                    "ip": data.get("ip", "Unknown IP"),
-                    "is_current": sid == current_session_id,
-                    "created_at": data.get("created_at"),
-                }
+            # ВАЖНО: Мы не делаем json.loads вручную!
+            # Pydantic сам парсит строку и валидирует её. Никакого Any и cast.
+            data = SessionData.model_validate_json(data_raw)
+
+            session_obj = SessionInfo(
+                session_id=sid,
+                device=data.device,
+                ip=data.ip,
+                is_current=(sid == current_session_id),
+                created_at=data.created_at,
             )
+            sessions.append(session_obj)
 
-        return sorted(sessions, key=lambda x: (x["is_current"], x["created_at"]), reverse=True)
+        # 4. Сортировка по объектам
+        return sorted(sessions, key=lambda x: (x.is_current, x.created_at or ""), reverse=True)
 
-    async def logout(self, user_id: int, session_id: str) -> dict:
+    async def logout(self, user_id: int, session_id: str | None) -> LogoutResponse:
+        if not session_id:
+            raise HTTPException(status_code=401, detail="Сессия не найдена")
         # Удаляем и данные, и индекс, и grace period
-        await self.redis.delete(f"refresh:{user_id}:{session_id}")
-        await self.redis.delete(f"grace_period:{user_id}:{session_id}")
-        await self.redis.zrem(f"user_sessions:{user_id}", session_id)
-        return {"status": "success", "message": "Вы успешно вышли из системы"}
+        keys_to_delete = [f"refresh:{user_id}:{session_id}", f"grace_period:{user_id}:{session_id}"]
 
-    async def logout_all(self, user_id: int) -> dict:
+        await self.redis.delete(*keys_to_delete)
+        await self.redis.zrem(f"user_sessions:{user_id}", session_id)
+
+        logger.info(f"USER_LOGOUT: User {user_id}, Session {session_id}")
+
+        return LogoutResponse(status="success", message="Вы успешно вышли из системы")
+
+    async def logout_all(self, user_id: int) -> LogoutAllResponse:
         """Полный логаут со всех устройств (Enterprise стандарт)."""
         index_key = f"user_sessions:{user_id}"
 
-        # 1. Получаем все SID из индекса (Sorted Set)
-        sids = await self.redis.zrange(index_key, 0, -1)
+        # Явно типизируем sids как список строк
+        sids: list[str] = await self.redis.zrange(index_key, 0, -1)
 
         if sids:
-            # Формируем список ключей для удаления данных самих сессий
-            keys_to_del = [f"refresh:{user_id}:{sid}" for sid in sids]
+            # Формируем плоский список ключей
+            keys_to_del: list[str] = []
+            for sid in sids:
+                keys_to_del.append(f"refresh:{user_id}:{sid}")
+                keys_to_del.append(f"grace_period:{user_id}:{sid}")
 
-            # Также добавляем в список на удаление все записи Grace Period для этих сессий
-            grace_keys = [f"grace_period:{user_id}:{sid}" for sid in sids]
+            # Добавляем сам индекс в список на удаление
+            keys_to_del.append(index_key)
 
-            # Удаляем всё пачкой (БД Redis это любит)
-            await self.redis.delete(*keys_to_del, *grace_keys, index_key)
+            # Удаляем всё одним запросом
+            await self.redis.delete(*keys_to_del)
             logger.info(f"Все сессии пользователя {user_id} аннулированы ({len(sids)} шт.)")
 
-        # 2. Дополнительная зачистка (на случай старых сессий без индекса)
-        # В Highload проектах SCAN используют аккуратно, но здесь это хорошая страховка
+        # 2. Дополнительная зачистка (страховка)
         async for key in self.redis.scan_iter(match=f"refresh:{user_id}:*"):
             await self.redis.delete(key)
-        return {"status": "success", "message": "Вы успешно вышли со всех устройств"}
+
+        return LogoutAllResponse(status="success", message="Вы успешно вышли со всех устройств")

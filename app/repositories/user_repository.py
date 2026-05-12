@@ -1,5 +1,4 @@
 import logging
-from typing import Any
 from uuid import UUID
 
 from sqlalchemy import and_, delete, select, update
@@ -16,7 +15,7 @@ logger = logging.getLogger("app.infra.db")
 class UserRepository:
     """Все операции с таблицей users с поддержкой UUID и Soft Delete."""
 
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
     async def get_by_id(self, user_id: int) -> User | None:
@@ -30,7 +29,7 @@ class UserRepository:
         return res.scalar_one_or_none()
 
     async def get_by_uuid(self, user_uuid: UUID) -> User | None:
-        """Публичный поиск по UUID (для API и Flutter).""" 
+        """Публичный поиск по UUID (для API и Flutter)."""
         stmt = (
             select(User)
             .options(selectinload(User.supplier_profile), selectinload(User.trip_guide_profile))
@@ -68,40 +67,43 @@ class UserRepository:
         now = func.now()
 
         # 1. Подготавливаем данные для нового пользователя
-        stmt = pg_insert(User).values(
-            phone=phone,
-            username=username,
-            is_email_verified=False,
-            is_active=True,
-            app_version=app_version,
-            last_active=now,
-            role="customer",
+        stmt = (
+            pg_insert(User)
+            .values(
+                phone=phone,
+                username=username,
+                is_email_verified=False,
+                is_active=True,
+                app_version=app_version,
+                last_active=now,
+                role="customer",
+            )
+            .on_conflict_do_update(
+                index_elements=["phone"],
+                set_={
+                    "username": User.username,
+                    "first_name": User.first_name,
+                    "last_name": User.last_name,
+                    "middle_name": User.middle_name,
+                    "email": User.email,
+                    "photo_url": User.photo_url,
+                    "is_email_verified": User.is_email_verified,
+                    "is_active": True,
+                    "app_version": app_version,
+                    "last_active": now,
+                    "role": User.role,
+                    "is_superuser": User.is_superuser,
+                    "deleted_at": None,
+                },
+            )
+            .returning(User)
         )
-
-        # 2. Логика при конфликте (если номер уже есть в базе)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["phone"],
-            set_={
-                "username": User.username,
-                "first_name": User.first_name,
-                "last_name": User.last_name,
-                "middle_name": User.middle_name,
-                "email": User.email,
-                "photo_url": User.photo_url,
-                "is_email_verified": User.is_email_verified,
-                "is_active": True,
-                "app_version": app_version,
-                "last_active": now,
-                "role": User.role,
-                "is_superuser": User.is_superuser,
-                "deleted_at": None,
-            },
-        ).returning(User)
-
         res = await self.db.execute(stmt)
-        return res.scalar_one()
+        # 2. Подсказываем mypy тип через аннотацию переменной
+        result: User = res.scalar_one()
+        return result
 
-    async def update_user(self, user_id: int, **values: Any) -> User | None:
+    async def update_user(self, user_id: int, **values: object) -> User | None:
         """Универсальное обновление по внутреннему ID."""
         # Если пришел пустой словарь значений, просто возвращаем текущего пользователя
         if not values:
@@ -121,7 +123,7 @@ class UserRepository:
         return res.scalar_one_or_none()
 
     async def update_activity(self, user_id: int, app_version: str | None = None) -> None:
-        values = {"last_active": func.now()}
+        values: dict[str, object] = {"last_active": func.now()}
         if app_version:
             values["app_version"] = app_version
 
@@ -129,7 +131,10 @@ class UserRepository:
         await self.db.execute(stmt)
 
     async def change_phone(self, user_id: int, new_phone: str) -> User:
-        return await self.update_user(user_id, phone=new_phone)
+        user = await self.update_user(user_id, phone=new_phone)
+        if not user:
+            raise ValueError(f"Пользователь с ID {user_id} не найден для смены номера")
+        return user
 
     async def get_by_phone_include_deleted(self, phone: str) -> User | None:
         """Поиск по телефону без фильтрации deleted_at."""

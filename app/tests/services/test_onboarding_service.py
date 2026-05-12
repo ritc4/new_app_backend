@@ -49,7 +49,7 @@ async def test_bank_webhook_idempotency(client, test_user, user_token):
     # Второй (повторный) вызов
     resp2 = await client.post("/api/v1/onboarding/webhook/bank", json=payload)
     assert resp2.status_code == 200
-    assert resp2.json()["message"] == "Already processed"
+    assert resp2.json()["message"] == "Данные уже были обработаны ранее"
 
 
 @pytest.mark.asyncio
@@ -155,7 +155,11 @@ async def test_restore_user_preserves_role(client, user_token, test_user):
 
 @pytest.mark.asyncio
 async def test_onboarding_to_supplier_conversion(
-    client: AsyncClient, db_session: AsyncSession, test_user: User, user_token: str, admin_token: str
+    client: AsyncClient,
+    db_session: AsyncSession,
+    test_user: User,
+    user_token: str,
+    admin_token: str,
 ) -> None:  # Добавили аннотации
     # СОХРАНЯЕМ данные заранее, чтобы не зависеть от состояния сессии
     current_user_id = test_user.id
@@ -174,7 +178,7 @@ async def test_onboarding_to_supplier_conversion(
     db_session.expire_all()
 
     result = await db_session.execute(
-        select(OnboardingApplication.id).where(OnboardingApplication.user_id == current_user_id)
+        select(OnboardingApplication.id).where(OnboardingApplication.user_id == current_user_id),
     )
     application_id = result.scalar()
 
@@ -221,7 +225,8 @@ async def test_onboarding_to_supplier_conversion(
 
     # 3. Админ одобряет
     approve_resp = await client.patch(
-        f"/api/v1/admin/onboarding/{application_id}/approve", headers={"Authorization": f"Bearer {admin_token}"}
+        f"/api/v1/admin/onboarding/{application_id}/approve",
+        headers={"Authorization": f"Bearer {admin_token}"},
     )
     assert approve_resp.status_code == 200
     db_session.expire_all()
@@ -235,7 +240,10 @@ async def test_onboarding_to_supplier_conversion(
 
 @pytest.mark.asyncio
 async def test_bank_webhook_phone_mismatch(
-    client: AsyncClient, db_session: AsyncSession, test_user: User, user_token: str
+    client: AsyncClient,
+    db_session: AsyncSession,
+    test_user: User,
+    user_token: str,
 ) -> None:
     # Сохраняем ID, так как после запросов к API сессия может обновиться
     u_id = test_user.id
@@ -308,7 +316,7 @@ async def test_cancel_and_restart_onboarding(client, user_token, db_session, tes
 
     res_final = await db_session.execute(
         # Используем сохраненный u_id вместо test_user.id
-        select(OnboardingApplication).where(OnboardingApplication.user_id == u_id)
+        select(OnboardingApplication).where(OnboardingApplication.user_id == u_id),
     )
     app_final = res_final.scalar_one()
 
@@ -318,7 +326,11 @@ async def test_cancel_and_restart_onboarding(client, user_token, db_session, tes
 
 @pytest.mark.asyncio
 async def test_onboarding_to_tripguide_conversion(
-    client: AsyncClient, db_session: AsyncSession, test_user: User, user_token: str, admin_token: str
+    client: AsyncClient,
+    db_session: AsyncSession,
+    test_user: User,
+    user_token: str,
+    admin_token: str,
 ) -> None:
     u_id = test_user.id
     u_phone = test_user.phone
@@ -362,7 +374,8 @@ async def test_onboarding_to_tripguide_conversion(
 
     # --- ШАГ 3: Одобрение админом ---
     await client.patch(
-        f"/api/v1/admin/onboarding/{application_id}/approve", headers={"Authorization": f"Bearer {admin_token}"}
+        f"/api/v1/admin/onboarding/{application_id}/approve",
+        headers={"Authorization": f"Bearer {admin_token}"},
     )
 
     # --- ШАГ 4: Проверка профиля ---

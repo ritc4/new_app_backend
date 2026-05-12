@@ -2,8 +2,12 @@ import asyncio
 import logging
 import sys
 
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.infra.db import async_session_maker, engine
 from app.infra.redis import get_redis_client
+from app.models.user import User
 from app.repositories.user_repository import UserRepository
 from app.services.auth_service import AuthService
 
@@ -13,12 +17,12 @@ logger = logging.getLogger("app.scripts.create_admin")
 class AdminPromoter:
     """Оркестратор процесса назначения администратора."""
 
-    def __init__(self, session, redis_client):
+    def __init__(self, session: AsyncSession, redis_client: "Redis[str]") -> None:
         self.session = session
         self.repo = UserRepository(session)
         self.auth = AuthService(session, redis_client)
 
-    async def execute(self, phone: str):
+    async def execute(self, phone: str) -> None:
         user = await self.repo.get_by_phone_include_deleted(phone)
 
         if not user:
@@ -33,7 +37,7 @@ class AdminPromoter:
         await self._promote(user)
         logger.info(f"Права СУПЕР-администратора для {phone} успешно выданы.")
 
-    async def _promote(self, user):
+    async def _promote(self, user: User) -> None:
         """Атомарная операция повышения прав до Суперюзера."""
         # ИСПРАВЛЕНО: Устанавливаем новую роль и статус владельца
         user.role = "admin"
@@ -44,7 +48,7 @@ class AdminPromoter:
         await self.auth.logout_all(user.id)
 
 
-async def main(phone: str):
+async def main(phone: str) -> None:
     redis = await get_redis_client()
     async with async_session_maker() as session:
         promoter = AdminPromoter(session, redis)

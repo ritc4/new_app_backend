@@ -7,9 +7,9 @@ from app.core.dependencies.auth import get_auth_service
 # from app.core.security import get_session_info
 from app.core.jwt import get_session_info
 from app.schemas.auth import (
-    ActionResponse,
     AppConfigResponse,
     OTPRequest,
+    OTPResponse,
     OTPVerifyRequest,
     RefreshRequest,
     TokenPairResponse,
@@ -28,7 +28,7 @@ AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
     description="Возвращает актуальные версии и ссылки",
     response_model=AppConfigResponse,
 )
-async def get_app_config(service: AuthServiceDep):
+async def get_app_config(service: AuthServiceDep) -> AppConfigResponse:
     # Теперь даже конфиг может отдавать сервис, чтобы в роутере не было логики settings
     return await service.get_app_config()
 
@@ -37,9 +37,9 @@ async def get_app_config(service: AuthServiceDep):
     "/request-otp",
     summary="Запрос кода подтверждения",
     description="Инициирует Flash Call на указанный номер телефона",
-    response_model=ActionResponse,
+    response_model=OTPResponse,
 )
-async def request_otp(payload: OTPRequest, request: Request, service: AuthServiceDep):
+async def request_otp(payload: OTPRequest, request: Request, service: AuthServiceDep) -> OTPResponse:
     _, ip = get_session_info(request)
     return await service.request_otp(payload.phone, ip)
 
@@ -50,7 +50,7 @@ async def request_otp(payload: OTPRequest, request: Request, service: AuthServic
     description="Обменивает OTP код на пару Access/Refresh токенов",
     response_model=TokenPairResponse,
 )
-async def verify_otp(payload: OTPVerifyRequest, request: Request, service: AuthServiceDep):
+async def verify_otp(payload: OTPVerifyRequest, request: Request, service: AuthServiceDep) -> TokenPairResponse:
     # Сервис сам проверит код и выполнит логин, вернув готовый TokenPairResponse
     return await service.verify_otp_and_login(payload, request)
 
@@ -61,5 +61,5 @@ async def verify_otp(payload: OTPVerifyRequest, request: Request, service: AuthS
     description="Выдает новый Access токен по валидному Refresh токену",
     response_model=TokenPairResponse,
 )
-async def refresh_access_token(payload: RefreshRequest, request: Request, service: AuthServiceDep):
+async def refresh_access_token(payload: RefreshRequest, request: Request, service: AuthServiceDep) -> TokenPairResponse:
     return await service.refresh_tokens(payload.refresh_token, request)

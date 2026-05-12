@@ -1,4 +1,7 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.base import ActionResponse
+from app.schemas.user import UserShort
 
 
 class AppConfigResponse(BaseModel):
@@ -19,6 +22,12 @@ class OTPRequest(BaseModel):
     )
 
 
+class OTPResponse(ActionResponse):
+    """Ответ на запрос OTP. Содержит только статус и сообщение."""
+
+    pass
+
+
 class OTPVerifyRequest(BaseModel):
     phone: str = Field(
         ...,
@@ -30,10 +39,27 @@ class OTPVerifyRequest(BaseModel):
     code: str = Field(..., pattern=r"^\d{4}$", examples=["7018"])
 
 
+AUTH_STRATEGY = "bearer"
+
+
 class TokenPairResponse(BaseModel):
     access_token: str
     refresh_token: str
-    token_type: str = "bearer"
+    token_type: str = AUTH_STRATEGY
+    is_new_user: bool
+
+
+class GraceSessionData(BaseModel):
+    """Внутренняя схема для типизации данных из Redis (Grace Period)."""
+
+    access: str
+    refresh: str
+    is_new: bool
+
+
+class AuthResult(BaseModel):
+    access_token: str
+    refresh_token: str
     is_new_user: bool
 
 
@@ -46,15 +72,28 @@ class CompleteRegistrationRequest(BaseModel):
     last_name: str | None = Field(None, max_length=50, examples=["Иванов"])
 
 
+class RegistrationResponse(ActionResponse):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+    user: UserShort  # Вкладываем существующую схему
+
+
 class SessionInfo(BaseModel):
     session_id: str
     device: str
     ip: str
     is_current: bool
+    created_at: str | None = None
 
 
-class ActionResponse(BaseModel):
-    """Универсальный ответ для действий без возврата данных (OTP, Logout и т.д.)"""
+class SessionData(BaseModel):
+    device: str = "Unknown Device"
+    ip: str = "Unknown IP"
+    created_at: str | None = None
 
-    status: str = "success"
-    message: str
+
+class LogoutResponse(ActionResponse):
+    pass
+
+
+class LogoutAllResponse(ActionResponse):
+    pass

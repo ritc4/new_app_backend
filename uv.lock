@@ -1416,6 +1416,7 @@ dev = [
     { name = "pytest-mock" },
     { name = "responses" },
     { name = "ruff" },
+    { name = "types-aiobotocore-s3" },
     { name = "types-passlib" },
     { name = "types-python-slugify" },
     { name = "types-redis" },
@@ -1455,6 +1456,7 @@ dev = [
     { name = "pytest-mock", specifier = ">=3.15.1" },
     { name = "responses", specifier = ">=0.26.0" },
     { name = "ruff", specifier = ">=0.15.10" },
+    { name = "types-aiobotocore-s3", specifier = ">=3.7.0" },
     { name = "types-passlib", specifier = ">=1.7.7.20260211" },
     { name = "types-python-slugify", specifier = ">=8.0.2.20240310" },
     { name = "types-redis", specifier = ">=4.6.0.20241004" },
@@ -2180,6 +2182,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f5/24/cb09efec5cc954f7f9b930bf8279447d24618bb6758d4f6adf2574c41780/typer-0.24.1.tar.gz", hash = "sha256:e39b4732d65fbdcde189ae76cf7cd48aeae72919dea1fdfc16593be016256b45", size = 118613, upload-time = "2026-02-21T16:54:40.609Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4a/91/48db081e7a63bb37284f9fbcefda7c44c277b18b0e13fbc36ea2335b71e6/typer-0.24.1-py3-none-any.whl", hash = "sha256:112c1f0ce578bfb4cab9ffdabc68f031416ebcc216536611ba21f04e9aa84c9e", size = 56085, upload-time = "2026-02-21T16:54:41.616Z" },
+]
+
+[[package]]
+name = "types-aiobotocore-s3"
+version = "3.7.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/ce/5b7baa06cde79ab5f083f56f060ccd2b60f6249127d70bbb8a37aafbdcd4/types_aiobotocore_s3-3.7.0.tar.gz", hash = "sha256:6ec738853dbba9133707991b98ea4dab19f7c62e02b3cca016e6cd8e3d684576", size = 77662, upload-time = "2026-05-10T03:17:35.088Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e9/ac/67240c3804a3e1c1e8f0f402155d7ed5351faf7a2085136083e5ca3f26b8/types_aiobotocore_s3-3.7.0-py3-none-any.whl", hash = "sha256:5dbb5479ece3e1aceaccac224fc3dd1ab7d912c4457419bd19e88a0a5b3844fc", size = 85450, upload-time = "2026-05-10T03:17:33.061Z" },
 ]
 
 [[package]]

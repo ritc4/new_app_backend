@@ -1,6 +1,8 @@
 import logging
+from typing import TypedDict
 
 import requests
+from celery import Task
 
 from app.config.settings import settings
 from app.infra.celery_app import celery_app
@@ -8,8 +10,21 @@ from app.infra.celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 
+# Описываем структуру вложенного поля payload
+class SigmaPayload(TypedDict):
+    sender: str
+    text: str
+
+
+# Описываем структуру всего тела запроса
+class SigmaRequestData(TypedDict):
+    recipient: str
+    type: str
+    payload: SigmaPayload
+
+
 @celery_app.task(name="send_flash_call", bind=True, max_retries=3, rate_limit="10/m")
-def send_flash_call_task(self, phone: str, code: str):
+def send_flash_call_task(self: Task, phone: str, code: str) -> dict[str, str]:
     """Задача для звонка Flash Call на requests (Синхронно и надежно)."""
 
     url, headers, payload = _prepare_sigma_request(phone, code)
@@ -35,7 +50,7 @@ def send_flash_call_task(self, phone: str, code: str):
         raise self.retry(exc=exc, countdown=15) from exc
 
 
-def _prepare_sigma_request(phone: str, code: str):
+def _prepare_sigma_request(phone: str, code: str) -> tuple[str, dict[str, str], SigmaRequestData]:
     """Приватный метод для сборки данных провайдера (Clean Code)."""
     return (
         settings.sigma.api_url,

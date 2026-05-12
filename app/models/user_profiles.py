@@ -63,7 +63,7 @@ class TripGuideProfile(Base):
 
     bio: Mapped[str | None] = mapped_column(String(1000))
     # Список языков (указываем тип List для линтера)
-    languages: Mapped[list | None] = mapped_column(JSON, default=list)
+    languages: Mapped[list[str] | None] = mapped_column(JSON, default=list)
     specialization: Mapped[str | None] = mapped_column(String(255))
     photo_certificate: Mapped[str | None] = mapped_column(String(500))
 

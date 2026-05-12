@@ -10,7 +10,10 @@ v1_router = APIRouter()
 v1_router.include_router(auth.router, prefix="/auth", tags=[RouteTag.AUTH])
 v1_router.include_router(users.router, prefix="/users", tags=[RouteTag.USERS])
 v1_router.include_router(
-    permissions.router, prefix="/admin", tags=[RouteTag.ADMIN], dependencies=[Depends(get_current_admin)]
+    permissions.router,
+    prefix="/admin",
+    tags=[RouteTag.ADMIN],
+    dependencies=[Depends(get_current_admin)],
 )
 v1_router.include_router(onboarding.router, prefix="/onboarding", tags=[RouteTag.ONBOARDING])
 

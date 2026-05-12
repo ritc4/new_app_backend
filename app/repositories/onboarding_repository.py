@@ -11,7 +11,7 @@ from app.schemas.onboarding import OnboardingStatus
 
 
 class OnboardingRepository:
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
     async def get_by_id(self, application_id: int) -> OnboardingApplication | None:
@@ -20,33 +20,35 @@ class OnboardingRepository:
         res = await self.db.execute(stmt)
         return res.scalar_one_or_none()
 
-    async def create(self, **kwargs) -> OnboardingApplication:
+    async def create(self, **kwargs: object) -> OnboardingApplication:
         """
         Создает новую заявку или перезаписывает существующую (Upsert).
         Явно затирает старые данные анкеты при перезапуске.
         """
-        stmt = pg_insert(OnboardingApplication).values(**kwargs)
-
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["user_id"],
-            set_={
-                # Берем новые значения из переданных в VALUES
-                "target_role": stmt.excluded.target_role,
-                "bank_type": stmt.excluded.bank_type,
-                # Принудительно сбрасываем состояние
-                "status": OnboardingStatus.PENDING_LEGAL,
-                "survey_payload": None,
-                "inn": None,
-                "admin_comment": None,
-                "external_id": None,
-                "created_at": func.now(),
-            },
-        ).returning(OnboardingApplication)
+        stmt = (
+            pg_insert(OnboardingApplication)
+            .values(**kwargs)
+            .on_conflict_do_update(
+                index_elements=["user_id"],
+                set_={
+                    "target_role": pg_insert(OnboardingApplication).excluded.target_role,
+                    "bank_type": pg_insert(OnboardingApplication).excluded.bank_type,
+                    "status": OnboardingStatus.PENDING_LEGAL,
+                    "survey_payload": None,
+                    "inn": None,
+                    "admin_comment": None,
+                    "external_id": None,
+                    "created_at": func.now(),
+                },
+            )
+            .returning(OnboardingApplication)
+        )
 
         res = await self.db.execute(stmt)
-        return res.scalar_one()
+        obj: OnboardingApplication = res.scalar_one()
+        return obj
 
-    async def update_by_user_id(self, user_id: int, **values) -> None:
+    async def update_by_user_id(self, user_id: int, **values: object) -> None:
         """Атомарное обновление заявки по ID пользователя."""
 
         stmt = update(OnboardingApplication).where(OnboardingApplication.user_id == user_id).values(**values)
@@ -63,7 +65,8 @@ class OnboardingRepository:
             OnboardingStatus.ON_MODERATION,
         ]
         stmt = select(OnboardingApplication).where(
-            OnboardingApplication.user_id == user_id, OnboardingApplication.status.in_(active_statuses)
+            OnboardingApplication.user_id == user_id,
+            OnboardingApplication.status.in_(active_statuses),
         )
         res = await self.db.execute(stmt)
         return res.scalar_one_or_none()
@@ -94,10 +97,11 @@ class OnboardingRepository:
                     OnboardingApplication.status != OnboardingStatus.APPROVED,
                     OnboardingApplication.created_at < limit_others,
                 ),
-            )
+            ),
         )
         result = await self.db.execute(stmt)
-        return result.rowcount
+        count = getattr(result, "rowcount", 0)
+        return int(count)
 
     async def cancel_application(self, user_id: int) -> bool:
         """Отмена пользователем только тех заявок, что не на модерации."""
@@ -110,4 +114,5 @@ class OnboardingRepository:
             .values(status=OnboardingStatus.CANCELED, admin_comment="Отменено пользователем")
         )
         result = await self.db.execute(stmt)
-        return result.rowcount > 0
+        count = getattr(result, "rowcount", 0)
+        return bool(count and count > 0)

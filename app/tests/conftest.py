@@ -127,10 +127,3 @@ async def user_token(test_user: User, redis_client: Redis) -> str:
 async def admin_token(test_admin: User, redis_client: Redis) -> str:
     access, _ = await create_tokens(user=test_admin, device_info="pytest", ip_address="127.0.0.1", r=redis_client)
     return access
-
-
-
-
-
-
-

@@ -1,5 +1,4 @@
 import logging
-from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,8 +10,13 @@ from app.schemas.onboarding import (
     ROLE_ALLOWED_PHOTOS,
     ROLE_SURVEY_SCHEMAS,
     BankWebhookPayload,
+    BankWebhookPayloadResponse,
+    CancelCurrentApplicationResponse,
+    OnboardingLinkResponse,
     OnboardingStart,
     OnboardingStatus,
+    OnboardingUploadResponse,
+    SubmitSurveyResponse,
 )
 from app.services.s3_service import S3Service
 
@@ -26,13 +30,13 @@ class OnboardingService:
         s3: S3Service,
         user_repo: UserRepository,
         onboarding_repo: OnboardingRepository,
-    ):
+    ) -> None:
         self.db = db
         self.s3 = s3
         self.users = user_repo
         self.onboarding = onboarding_repo
 
-    async def create_application(self, user_id: int, data: OnboardingStart) -> dict[str, str]:
+    async def create_application(self, user_id: int, data: OnboardingStart) -> OnboardingLinkResponse:
         """Шаг 0: Проверка и создание/Upsert заявки с очисткой старых данных."""
 
         # 1. Ищем только АКТИВНЫЕ заявки (pending_legal, filling_survey, on_moderation)
@@ -49,7 +53,7 @@ class OnboardingService:
                 )
             # Если роли совпадают — просто отдаем старую ссылку
             link = f"https://{existing.bank_type}.ru/bind?state=user_{user_id}"
-            return {"link": link}
+            return OnboardingLinkResponse(status="ok", message="Продолжение регистрации", link=link)
 
         # 2. Если активной заявки нет (она None или в архивном статусе)
         link = f"https://{data.bank}.ru/bind?state=user_{user_id}"
@@ -66,9 +70,9 @@ class OnboardingService:
         await self.db.commit()
         logger.info("ОНБОРДИНГ_СТАРТ: Пользователь %s начал регистрацию как %s", user_id, data.target_role)
 
-        return {"link": link}
+        return OnboardingLinkResponse(status="ok", message="Заявка успешно создана", link=link)
 
-    async def process_bank_webhook(self, bank_payload: BankWebhookPayload) -> dict[str, str]:
+    async def process_bank_webhook(self, bank_payload: BankWebhookPayload) -> BankWebhookPayloadResponse:
         """Шаг 1: Проверяем активную заявку и идемпотентность."""
         user_id = bank_payload.user_id
         app = await self.onboarding.get_pending_by_user(user_id)
@@ -78,7 +82,7 @@ class OnboardingService:
 
         if app.status in [OnboardingStatus.FILLING_SURVEY, OnboardingStatus.ON_MODERATION, OnboardingStatus.REJECTED]:
             logger.info("ВЕБХУК_ПОВТОР: Заявка %s уже в статусе %s", app.id, app.status)
-            return {"status": "ok", "message": "Already processed"}
+            return BankWebhookPayloadResponse(status="ok", message="Данные уже были обработаны ранее")
 
         """Шаг 2: Верификация данных банка."""
         user = await self.users.get_by_id(user_id)
@@ -88,7 +92,10 @@ class OnboardingService:
         # Проверка телефона
         if user.phone != bank_payload.phone:
             logger.warning(
-                "НЕСОВПАДЕНИЕ_ТЕЛЕФОНА: User %s (App: %s, Bank: %s)", user_id, user.phone, bank_payload.phone
+                "НЕСОВПАДЕНИЕ_ТЕЛЕФОНА: User %s (App: %s, Bank: %s)",
+                user_id,
+                user.phone,
+                bank_payload.phone,
             )
             # Отклоняем заявку и сразу фиксируем
             await self.onboarding.update_by_user_id(
@@ -115,7 +122,9 @@ class OnboardingService:
 
             # 2. Статус заявки и ИНН
             await self.onboarding.update_by_user_id(
-                user_id, status=OnboardingStatus.FILLING_SURVEY, inn=bank_payload.inn
+                user_id,
+                status=OnboardingStatus.FILLING_SURVEY,
+                inn=bank_payload.inn,
             )
 
             # Финальный коммит — если что-то упадет выше, ни одна таблица не изменится
@@ -127,9 +136,9 @@ class OnboardingService:
             logger.error("ОШИБКА_ОБНОВЛЕНИЯ_ВЕБХУКА: User ID %s, Error: %s", user_id, e, exc_info=True)
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Ошибка при сохранении данных банка") from e
 
-        return {"status": "ok"}
+        return BankWebhookPayloadResponse(status="ok", message="Заявка успешно обновлена")
 
-    async def submit_survey(self, user_id: int, survey_data: dict[str, Any]) -> dict[str, str]:
+    async def submit_survey(self, user_id: int, survey_data: dict[str, object]) -> SubmitSurveyResponse:
         """Шаг 3: Валидация анкеты и перевод на модерацию."""
         app = await self.onboarding.get_pending_by_user(user_id)
 
@@ -143,7 +152,8 @@ class OnboardingService:
 
         try:
             # 2. Валидируем и дампим в JSON
-            validated_data = schema_class.model_validate(survey_data).model_dump(mode="json")
+            instance = schema_class(**survey_data)
+            validated_data = instance.model_dump(mode="json")
         except Exception as e:
             logger.error("ОШИБКА_ВАЛИДАЦИИ_АНКЕТЫ: User ID %s, Error: %s", user_id, e)
             # Pydantic выбросит понятную ошибку, если, например, стаж < 3 лет
@@ -151,14 +161,21 @@ class OnboardingService:
 
         # Сохраняем через репозиторий
         await self.onboarding.update_by_user_id(
-            user_id, survey_payload=validated_data, status=OnboardingStatus.ON_MODERATION
+            user_id,
+            survey_payload=validated_data,
+            status=OnboardingStatus.ON_MODERATION,
         )
 
         await self.db.commit()
         logger.info("АНКЕТА_ОТПРАВЛЕНА: Пользователь ID %s переведен на модерацию.", user_id)
-        return {"status": "success", "message": "Анкета успешно отправлена"}
+        return SubmitSurveyResponse(status="success", message="Анкета успешно отправлена")
 
-    async def get_onboarding_upload_url(self, user_id: int, file_type: str, content_type: str) -> dict[str, Any]:
+    async def get_onboarding_upload_url(
+        self,
+        user_id: int,
+        file_type: str,
+        content_type: str,
+    ) -> OnboardingUploadResponse:
         app = await self.onboarding.get_pending_by_user(user_id)
         if not app or app.status != OnboardingStatus.FILLING_SURVEY:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Загрузка недоступна")
@@ -176,15 +193,15 @@ class OnboardingService:
 
         try:
             s3_res = await self.s3.get_upload_params(object_name, content_type)
-            return {
-                "upload_data": s3_res["upload_data"],
-                "file_url": s3_res["public_url"],
-            }
+            return OnboardingUploadResponse(
+                upload_data=s3_res["upload_data"]["fields"],
+                file_url=s3_res["public_url"],
+            )
         except Exception as e:
             logger.error(f"Ошибка S3 при подготовке документа {file_type} для User {user_id}: {e}")
             raise HTTPException(500, "Не удалось сгенерировать ссылку для загрузки") from e
 
-    async def cancel_current_application(self, user_id: int) -> dict[str, str]:
+    async def cancel_current_application(self, user_id: int) -> CancelCurrentApplicationResponse:
         """Новый метод для отмены заявки пользователем."""
         app = await self.onboarding.get_pending_by_user(user_id)
 
@@ -198,6 +215,6 @@ class OnboardingService:
         success = await self.onboarding.cancel_application(user_id)
         if success:
             await self.db.commit()
-            return {"status": "success", "message": "Заявка отменена"}
+            return CancelCurrentApplicationResponse(status="success", message="Заявка отменена")
 
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Не удалось отменить заявку")

@@ -23,5 +23,9 @@ async def get_admin_service(
 
     # 2. Передаем всё в конструктор сервиса (Инъекция зависимостей)
     return AdminService(
-        db=db, auth_service=auth_service, onboarding_repo=onboarding_repo, user_repo=user_repo, log_repo=log_repo
+        db=db,
+        auth_service=auth_service,
+        onboarding_repo=onboarding_repo,
+        user_repo=user_repo,
+        log_repo=log_repo,
     )

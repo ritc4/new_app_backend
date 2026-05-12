@@ -36,6 +36,7 @@ dev = [
     "pytest-mock>=3.15.1",
     "responses>=0.26.0",
     "ruff>=0.15.10",
+    "types-aiobotocore-s3>=3.7.0",
     "types-passlib>=1.7.7.20260211",
     "types-python-slugify>=8.0.2.20240310",
     "types-redis>=4.6.0.20241004",
@@ -56,7 +57,11 @@ line-length = 120
 
 [tool.ruff.lint]
 # Группируем ВСЕ настройки линтера в одной секции
-select = ["E", "F", "I", "N", "B", "UP"]
+select = [
+    "E", "F", "I", "N", "B", "UP", "S", 
+    "ANN", "PT", "RET", "ARG", "COM", "T20"
+]
+ignore = ["COM812"] 
 fixable = ["ALL"]
 
 [tool.ruff.format]
@@ -67,12 +72,21 @@ indent-style = "space"
 
 [tool.mypy]
 python_version = "3.12"
-strict = true  # Включает почти все строгие проверки
+strict = true
 ignore_missing_imports = true
+disallow_untyped_decorators = false
 warn_unused_configs = true
+disallow_any_generics = true
+disallow_any_explicit = true
+disallow_any_expr = false
+disallow_any_decorated = true
+warn_return_any = true
+no_implicit_optional = true
+warn_unused_ignores = true
+check_untyped_defs = true
+local_partial_types = true
 exclude = [
     "app/migrations/",
-    "app/tests/"
 ]
 
 # Плагины для корректной работы с FastAPI/Pydantic и SQLAlchemy
@@ -82,14 +96,43 @@ plugins = [
 ]
 
 [[tool.mypy.overrides]]
-# Отключаем строгую проверку для библиотек без типов, если возникнут проблемы
 module = [
+    "celery.*",
     "aioboto3.*",
     "user_agents.*",
     "jose.*",
-    "passlib.*"
+    "botocore.*",
 ]
 ignore_missing_imports = true
+disallow_any_explicit = false
+
+[[tool.mypy.overrides]]
+# Послабления для тестов
+module = "app.tests.*"
+check_untyped_defs = false
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_decorators = false
+# Глушим специфические ошибки тестов (Any, атриубты, аргументы типов)
+disable_error_code = ["misc", "type-arg", "assignment", "attr-defined", "operator", "arg-type"]
+
+[[tool.mypy.overrides]]
+# Исключение конкретно для ошибки Any в настройках
+module = "app.config.settings"
+disallow_any_explicit = false
+
+[[tool.mypy.overrides]]
+# Исключение для воркеров Celery, так как их декораторы ломают типизацию
+module = "app.workers.*"
+disallow_untyped_decorators = false
+# Если ошибка [misc] не уйдет, добавь эту строку:
+disable_error_code = ["misc"]
+
+[tool.ruff.lint.per-file-ignores]
+# В тестах разрешаем assert (S101) и отсутствие аннотаций в аргументах (ANN)
+"app/tests/*" = ["S101", "ANN", "S311", "ARG001", "T201", "S105", "S106"]
+"app/scripts/*" = ["T201"]
+"app/migrations/*" = ["ANN", "E501"] 
 
 [tool.pydantic-mypy]
 init_forbid_extra = true

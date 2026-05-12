@@ -52,9 +52,9 @@ class Settings(BaseSettings):
     def settings_customise_sources(
         cls,
         settings_cls: type[BaseSettings],
-        init_settings,  # 1. То, что передано в коде
-        dotenv_settings,  # 2. Файл .env (ВЫСОКИЙ ПРИОРИТЕТ)
-        env_settings,  # 3. Переменные окружения системы
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         return (
@@ -71,13 +71,13 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-print(settings)
-print(settings.model_dump_json(indent=2))
-print("db password:", settings.db.password.get_secret_value())
-print("Путь к .env:", BASE_DIR / ".env")
-print("db url:", str(settings.db.async_url))
-print("redis url:", str(settings.redis.url))
-print("redis url:", str(settings.redis.url))
-print(f"RabbitMQ URL: {settings.rabbitmq.url}")
-print(f"CORS Origins: {settings.http.cors_origins}")
-print("auth secret key:", settings.auth.secret_key.get_secret_value())
+# print(settings)
+# print(settings.model_dump_json(indent=2))
+# print("db password:", settings.db.password.get_secret_value())
+# print("Путь к .env:", BASE_DIR / ".env")
+# print("db url:", str(settings.db.async_url))
+# print("redis url:", str(settings.redis.url))
+# print("redis url:", str(settings.redis.url))
+# print(f"RabbitMQ URL: {settings.rabbitmq.url}")
+# print(f"CORS Origins: {settings.http.cors_origins}")
+# print("auth secret key:", settings.auth.secret_key.get_secret_value())

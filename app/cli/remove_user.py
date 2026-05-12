@@ -7,9 +7,9 @@
 #     # Создаем всё локально внутри ОДНОГО цикла событий
 #     async with async_session_maker() as session:
 #         # Инициализируем сервисы
-#         service = UserService(db=session, ...) 
+#         service = UserService(db=session, ...)
 #         await service.perform_full_cleanup()
-    
+
 #     # Полная очистка ресурсов перед выходом
 #     await engine.dispose()
 #     await redis_pool.aclose()

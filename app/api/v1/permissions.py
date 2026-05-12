@@ -8,8 +8,8 @@ from app.core.dependencies.admin import get_admin_service
 from app.core.security import get_current_admin
 from app.models.user import User
 from app.schemas.admin import AdminActionResponse, AdminChangePhoneRequest
+from app.schemas.base import UserRole
 from app.schemas.onboarding import OnboardingAppShort, RejectApplicationRequest
-from app.schemas.user import UserRole
 from app.services.admin_service import AdminService
 
 router = APIRouter()
@@ -24,14 +24,21 @@ CurrentAdminDep = Annotated[User, Depends(get_current_admin)]
     summary="Изменить рабочую роль (Aдмин/Клиент)",
     response_model=AdminActionResponse,
 )
-async def set_user_role(user_uuid: UUID, role: UserRole, admin: CurrentAdminDep, service: AdminServiceDep):
+async def set_user_role(
+    user_uuid: UUID,
+    role: UserRole,
+    admin: CurrentAdminDep,
+    service: AdminServiceDep,
+) -> AdminActionResponse:
     return await service.set_user_role(admin, user_uuid, role)
 
 
 @router.patch(
-    "/ban/{user_uuid}", summary="Заблокировать/Разблокировать пользователя", response_model=AdminActionResponse
+    "/ban/{user_uuid}",
+    summary="Заблокировать/Разблокировать пользователя",
+    response_model=AdminActionResponse,
 )
-async def toggle_user_ban(user_uuid: UUID, admin: CurrentAdminDep, service: AdminServiceDep):
+async def toggle_user_ban(user_uuid: UUID, admin: CurrentAdminDep, service: AdminServiceDep) -> AdminActionResponse:
     return await service.toggle_user_ban(admin, user_uuid)
 
 
@@ -41,8 +48,11 @@ async def toggle_user_ban(user_uuid: UUID, admin: CurrentAdminDep, service: Admi
     response_model=AdminActionResponse,
 )
 async def admin_change_phone(
-    user_uuid: UUID, data: AdminChangePhoneRequest, admin: CurrentAdminDep, service: AdminServiceDep
-):
+    user_uuid: UUID,
+    data: AdminChangePhoneRequest,
+    admin: CurrentAdminDep,
+    service: AdminServiceDep,
+) -> AdminActionResponse:
     return await service.admin_change_phone(admin, user_uuid, data.new_phone)
 
 
@@ -51,7 +61,11 @@ async def admin_change_phone(
     summary="Одобрить заявку партнера",
     response_model=AdminActionResponse,
 )
-async def approve_onboarding(application_id: int, admin: CurrentAdminDep, service: AdminServiceDep):
+async def approve_onboarding(
+    application_id: int,
+    admin: CurrentAdminDep,
+    service: AdminServiceDep,
+) -> AdminActionResponse:
     return await service.approve_partner_application(admin, application_id)
 
 
@@ -65,7 +79,7 @@ async def reject_onboarding(
     data: RejectApplicationRequest,  # Обязательная причина
     admin: CurrentAdminDep,
     service: AdminServiceDep,
-):
+) -> AdminActionResponse:
     return await service.reject_partner_application(admin, application_id, data.reason)
 
 
@@ -76,6 +90,9 @@ async def reject_onboarding(
     response_model=list[OnboardingAppShort],
 )
 async def list_pending_onboarding(
-    admin: CurrentAdminDep, service: AdminServiceDep, limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)
-):
+    admin: CurrentAdminDep,
+    service: AdminServiceDep,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> list[OnboardingAppShort]:
     return await service.get_pending_applications(admin, limit, offset)

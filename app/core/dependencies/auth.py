@@ -11,6 +11,6 @@ from app.services.auth_service import AuthService
 
 async def get_auth_service(
     db: Annotated[AsyncSession, Depends(get_db)],
-    redis_client: Annotated[Redis, Depends(get_redis_client)],
+    redis_client: Annotated["Redis[str]", Depends(get_redis_client)],
 ) -> AuthService:
-    return AuthService(db=db, redis_client=redis_client) 
+    return AuthService(db=db, redis_client=redis_client)

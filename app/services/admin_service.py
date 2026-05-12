@@ -1,18 +1,17 @@
 import logging
-from collections.abc import Sequence
-from datetime import datetime
 from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.onboarding import OnboardingApplication
 from app.models.user import User
 from app.models.user_profiles import SupplierProfile, TripGuideProfile
 from app.repositories.admin_log_repository import AdminLogRepository
 from app.repositories.onboarding_repository import OnboardingRepository
 from app.repositories.user_repository import UserRepository
-from app.schemas.user import UserRole
+from app.schemas.admin import AdminActionResponse, UserAdminView
+from app.schemas.base import UserRole
+from app.schemas.onboarding import OnboardingAppShort, SupplierSurvey, TripguideSurvey
 from app.services.auth_service import AuthService
 
 logger = logging.getLogger("app.services.admin")
@@ -26,14 +25,14 @@ class AdminService:
         onboarding_repo: OnboardingRepository,
         user_repo: UserRepository,
         log_repo: AdminLogRepository,
-    ):
+    ) -> None:
         self.db = db
         self.auth = auth_service
         self.repo = user_repo
         self.onboarding = onboarding_repo
         self.log_repo = log_repo
 
-    def _validate_hierarchy(self, actor: User, target: User, new_role: UserRole | None = None):
+    def _validate_hierarchy(self, actor: User, target: User, new_role: UserRole | None = None) -> None:
         # Если это один и тот же человек (редактирую сам себя)
         if actor.id == target.id:
             # Суперюзеру нельзя менять свою роль на что-то ниже,
@@ -56,7 +55,7 @@ class AdminService:
             if actor.level <= new_level:
                 raise HTTPException(403, "Вы не можете назначать роль равную или выше вашей")
 
-    async def set_user_role(self, admin: User, user_uuid: UUID, role: UserRole) -> dict:
+    async def set_user_role(self, admin: User, user_uuid: UUID, role: UserRole) -> AdminActionResponse:
         """Смена роли (Aдмин/Клиент). Сбрасывает сессии только при назначении/снятии админки."""
         self._ensure_admin_access(admin)
         user = await self.repo.get_by_uuid(user_uuid)
@@ -87,6 +86,9 @@ class AdminService:
             # нельзя было стать супером.
             updated_user = await self.repo.update_user(user.id, role=role.value, is_superuser=False)
 
+            if updated_user is None:
+                raise HTTPException(500, "Не удалось обновить данные пользователя в базе")
+
             # --- АУДИТ ---
             await self.log_repo.create_admin_log(
                 admin_id=admin.id,
@@ -102,12 +104,16 @@ class AdminService:
                 logger.info(f"Сессии пользователя {user.id} сброшены (смена админ-прав)")
 
             logger.info(f"Админ {admin.id} установил роль {role} пользователю {user.id}")
-            return {"message": f"Пользователю {updated_user.phone} назначена роль {role}", "user": updated_user}
+            return AdminActionResponse(
+                status="success",
+                message=f"Пользователю {updated_user.phone} назначена роль {role}",
+                user=UserAdminView.model_validate(updated_user),
+            )
         except Exception as e:
             await self.db.rollback()
             raise HTTPException(500, "Ошибка при сохранении роли") from e
 
-    async def admin_change_phone(self, admin: User, user_uuid: UUID, new_phone: str) -> dict:
+    async def admin_change_phone(self, admin: User, user_uuid: UUID, new_phone: str) -> AdminActionResponse:
         """Принудительная смена номера телефона."""
         self._ensure_admin_access(admin)
         user = await self.repo.get_by_uuid(user_uuid)
@@ -135,14 +141,18 @@ class AdminService:
             await self.db.commit()
             await self.auth.logout_all(user.id)
             logger.info(f"Админ {admin.id} сменил номер для User {user.id} на {new_phone}")
-            return {"message": f"Номер пользователя {updated_user.uuid} изменен на {new_phone}", "user": updated_user}
+            return AdminActionResponse(
+                status="success",
+                message=f"Номер пользователя {updated_user.uuid} изменен на {new_phone}",
+                user=UserAdminView.model_validate(updated_user),
+            )
         except Exception as e:
             await self.db.rollback()
             raise HTTPException(500, "Ошибка смены номера телефона") from e
 
     # --- Вспомогательные методы ---
 
-    def _ensure_admin_access(self, admin: User):
+    def _ensure_admin_access(self, admin: User) -> None:
         """Проверка прав администратора через уровень доступа (Fail Fast)."""
         # Уровень 50 — это минимальный порог для доступа к админ-панели
         if admin.level < 50:
@@ -156,7 +166,7 @@ class AdminService:
         if not admin.is_active:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Аккаунт администратора неактивен")
 
-    async def toggle_user_ban(self, admin: User, user_uuid: UUID) -> dict:
+    async def toggle_user_ban(self, admin: User, user_uuid: UUID) -> AdminActionResponse:
         """Блокировка или разблокировка пользователя."""
         self._ensure_admin_access(admin)
 
@@ -181,6 +191,9 @@ class AdminService:
 
             updated_user = await self.repo.update_user(user.id, is_banned=new_ban_status)
 
+            if updated_user is None:
+                raise HTTPException(500, "Не удалось обновить статус блокировки в базе данных")
+
             # --- АУДИТ ---
             await self.log_repo.create_admin_log(admin_id=admin.id, target_id=user.id, action=action_type)
             await self.db.commit()
@@ -191,80 +204,82 @@ class AdminService:
                 logger.warning(f"БЛОКИРОВКА: Админ {admin.id} забанил пользователя {user.id}")
             else:
                 logger.info(f"РАЗБЛОКИРОВКА: Админ {admin.id} разблокировал пользователя {user.id}")
+
+            # 6. Возвращаем результат
             status_ru = "заблокирован" if new_ban_status else "разблокирован"
 
-            return {
-                "message": f"Пользователь {updated_user.phone} успешно {status_ru}",
-                "is_banned": new_ban_status,  # Можно оставить для удобства фронта
-                "user": updated_user,
-            }
+            return AdminActionResponse(
+                message=f"Пользователь {updated_user.phone} успешно {status_ru}",
+                is_banned=new_ban_status,  # Можно оставить для удобства фронта
+                user=UserAdminView.model_validate(updated_user),
+            )
 
         except Exception as e:
             await self.db.rollback()
             logger.error(f"Ошибка при смене статуса бана User {user.id}: {e}")
             raise HTTPException(500, "Ошибка при изменении статуса блокировки") from e
 
-    async def approve_partner_application(self, admin: User, application_id: int) -> dict:
+    async def approve_partner_application(self, admin: User, application_id: int) -> AdminActionResponse:
         """Одобрение партнера: перенос данных в профиль и смена роли."""
         self._ensure_admin_access(admin)
 
         # 1. Получаем заявку
         app = await self.onboarding.get_by_id(application_id)
-
         if not app or app.status != "on_moderation":
             raise HTTPException(400, "Заявка не найдена или не готова к проверке")
 
         try:
-            survey = app.survey_payload or {}  # Защита от None
+            survey_data = app.survey_payload or {}
 
+            # --- ЛОГИКА ОДОБРЕНИЯ (Простой и строгий Type Safety) ---
             if app.target_role == UserRole.SUPPLIER:
-                # Превращаем строку даты в объект date для БД
-                expiry_date = survey.get("license_expiry_date")
-                if isinstance(expiry_date, str):
-                    expiry_date = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+                # Прямая валидация конкретной схемой — MyPy видит все поля
+                survey_sup = SupplierSurvey.model_validate(survey_data)
 
-                new_profile = SupplierProfile(
-                    user_id=app.user_id,
-                    # Авто данные
-                    car_model=survey.get("car_model"),
-                    car_year=int(survey.get("car_year", 0)),
-                    car_number=survey.get("car_number"),
-                    car_color=survey.get("car_color"),
-                    vin_number=survey.get("vin_number"),
-                    # Документы
-                    license_number=survey.get("license_number"),
-                    license_expiry_date=expiry_date,
-                    license_country=survey.get("license_country", "RU"),
-                    experience_years=int(survey.get("experience_years", 0)),
-                    # Технические фото
-                    photo_selfie=survey.get("photo_selfie"),
-                    photo_car_front=survey.get("photo_car_front"),
-                    photo_car_back=survey.get("photo_car_back"),
-                    photo_sts_front=survey.get("photo_sts_front"),
-                    photo_sts_back=survey.get("photo_sts_back"),
-                    photo_license=survey.get("photo_license"),
+                self.db.add(
+                    SupplierProfile(
+                        user_id=app.user_id,
+                        car_model=survey_sup.car_model,
+                        car_year=survey_sup.car_year,
+                        car_number=survey_sup.car_number,
+                        car_color=survey_sup.car_color,
+                        vin_number=survey_sup.vin_number,
+                        license_number=survey_sup.license_number,
+                        license_expiry_date=survey_sup.license_expiry_date,
+                        license_country=survey_sup.license_country,
+                        experience_years=survey_sup.experience_years,
+                        photo_selfie=survey_sup.photo_selfie,
+                        photo_car_front=survey_sup.photo_car_front,
+                        photo_car_back=survey_sup.photo_car_back,
+                        photo_sts_front=survey_sup.photo_sts_front,
+                        photo_sts_back=survey_sup.photo_sts_back,
+                        photo_license=survey_sup.photo_license,
+                    ),
                 )
-                self.db.add(new_profile)
-
-                await self.repo.update_user(app.user_id, photo_url=survey.get("photo_selfie"))
+                # Обновляем фото пользователя из анкеты
+                await self.repo.update_user(app.user_id, photo_url=survey_sup.photo_selfie)
 
             elif app.target_role == UserRole.TRIP_GUIDE:
-                # Создаем запись в таблице гидов
-                new_profile = TripGuideProfile(
-                    user_id=app.user_id,
-                    bio=survey.get("bio"),
-                    languages=survey.get("languages", []),
-                    specialization=survey.get("specialization"),
+                # Валидация схемой гида
+                survey_guide = TripguideSurvey.model_validate(survey_data)
+
+                self.db.add(
+                    TripGuideProfile(
+                        user_id=app.user_id,
+                        bio=survey_guide.bio,
+                        languages=survey_guide.languages,
+                        specialization=survey_guide.specialization,
+                    ),
                 )
-                self.db.add(new_profile)
 
-            # 2. Меняем роль в основной таблице пользователей
+            else:
+                raise HTTPException(400, f"Неподдерживаемая роль: {app.target_role}")
+
+            # 2. Обновляем статусы и транзакцию
             await self.repo.update_user(app.user_id, role=app.target_role)
-
-            # 3. Закрываем заявку
             await self.onboarding.update_by_user_id(app.user_id, status="approved")
 
-            # 4. Аудит
+            # 3. Аудит
             await self.log_repo.create_admin_log(
                 admin_id=admin.id,
                 target_id=app.user_id,
@@ -272,25 +287,33 @@ class AdminService:
                 details={"role": app.target_role, "app_id": application_id},
             )
 
-            # Теперь фиксируем всё одной транзакцией
+            # Фиксируем всё одной транзакцией
             await self.db.commit()
+
+            # 4. Подготовка ответа
             updated_user = await self.repo.get_by_id(app.user_id)
-            if updated_user:
-                # Принудительно обновляем, чтобы SQLAlchemy увидела созданный профиль
-                await self.db.refresh(updated_user)
+            if not updated_user:
+                raise HTTPException(404, "Пользователь не найден после обновления")
+
+            # Принудительно обновляем, чтобы SQLAlchemy увидела созданный профиль
+            await self.db.refresh(updated_user)
+
             logger.info(f"Админ {admin.id} одобрил партнера {app.user_id} ({app.target_role})")
-            return {
-                "status": "success",
-                "message": "Партнер успешно активирован и профиль создан",
-                "user": updated_user,
-            }
+
+            return AdminActionResponse(
+                status="success",
+                message="Партнер успешно активирован и профиль создан",
+                user=UserAdminView.model_validate(updated_user),
+            )
 
         except Exception as e:
             await self.db.rollback()
+            if isinstance(e, HTTPException):
+                raise e
             logger.error(f"Критическая ошибка активации {application_id}: {e}")
-            raise HTTPException(500, "Ошибка при сохранении профиля") from e
+            raise HTTPException(500, "Ошибка при сохранении профиля партнера") from e
 
-    async def reject_partner_application(self, admin: User, application_id: int, reason: str) -> dict[str, str]:
+    async def reject_partner_application(self, admin: User, application_id: int, reason: str) -> AdminActionResponse:
         """Отклонение заявки с указанием причины (Standard Яндекс)."""
         self._ensure_admin_access(admin)
 
@@ -321,18 +344,24 @@ class AdminService:
 
             # 3. Уведомление (опционально в будущем)
             # await self.notifications.send_push(app.user_id, f"Заявка отклонена: {reason}")
+            user = await self.repo.get_by_id(app.user_id)
+            if not user:
+                raise HTTPException(404, "Пользователь не найден")
 
             logger.info(f"Админ {admin.id} отклонил заявку {application_id}. Причина: {reason}")
-            return {"status": "success", "message": "Заявка отклонена, пользователю отправлено уведомление"}
+            return AdminActionResponse(
+                status="success",
+                message="Заявка отклонена, пользователю отправлено уведомление",
+                user=UserAdminView.model_validate(user),
+            )
 
         except Exception as e:
             await self.db.rollback()
             logger.error(f"Ошибка при отклонении заявки {application_id}: {e}")
             raise HTTPException(500, "Ошибка сохранения данных") from e
 
-    async def get_pending_applications(
-        self, admin: User, limit: int = 20, offset: int = 0
-    ) -> Sequence[OnboardingApplication]:
+    async def get_pending_applications(self, admin: User, limit: int = 20, offset: int = 0) -> list[OnboardingAppShort]:
         """Получить очередь на модерацию."""
         self._ensure_admin_access(admin)
-        return await self.onboarding.get_moderation_list(limit, offset)
+        applications = await self.onboarding.get_moderation_list(limit, offset)
+        return [OnboardingAppShort.model_validate(app) for app in applications]

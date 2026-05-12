@@ -29,7 +29,7 @@ async def get_current_user(
     request: Request,
     background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
-    r: Annotated[Redis, Depends(get_redis_client)],
+    r: Annotated["Redis[str]", Depends(get_redis_client)],
 ) -> User:
     """
     Главная зависимость для получения текущего пользователя.
@@ -53,6 +53,9 @@ async def get_current_user(
         # 2. ДЕКОДИРОВАНИЕ И ПРОВЕРКА ТИПА ТОКЕНА
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         u_id, s_id = payload.get("id"), payload.get("jti")
+
+        if not isinstance(u_id, int) or not isinstance(s_id, str):
+            raise credentials_exception
 
         if payload.get("type") != "access":
             logger.warning(f"Попытка доступа с типом токена {payload.get('type')}. User: {u_id}")
@@ -88,6 +91,7 @@ async def get_current_admin(user: Annotated[User, Depends(get_current_user)]) ->
     if user.level < 50:
         logger.warning(f"Доступ запрещен: пользователь {user.id} с уровнем {user.level} не админ.")
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Доступ запрещен: требуются права администратора"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Доступ запрещен: требуются права администратора",
         )
     return user

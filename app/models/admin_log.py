@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -31,7 +31,7 @@ class AdminLog(Base):
 
     # Храним старое и новое значение (например, старую и новую роль)
     # Типизируем как dict[str, Any] для удобства работы в Python
-    details: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    details: Mapped[dict[str, object] | None] = mapped_column(JSON)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

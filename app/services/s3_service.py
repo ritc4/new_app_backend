@@ -1,15 +1,24 @@
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import aioboto3
 from botocore.config import Config
 
 from app.config.settings import settings
+from app.schemas.s3 import S3UploadResult
 
 logger = logging.getLogger("app.services.s3")
 
 
+if TYPE_CHECKING:
+    from types_aiobotocore_s3 import S3Client
+    from types_aiobotocore_s3.type_defs import ObjectIdentifierTypeDef
+
+
 class S3Service:
-    def __init__(self):
+    def __init__(self) -> None:
         self.session = aioboto3.Session()
         self.bucket = settings.s3.bucket_name
         self.endpoint_url = settings.s3.endpoint_url.rstrip("/")
@@ -25,7 +34,7 @@ class S3Service:
             "region_name": settings.s3.region,
         }
 
-    async def get_upload_params(self, object_name: str, content_type: str, expires_in: int = 900) -> dict:
+    async def get_upload_params(self, object_name: str, content_type: str, expires_in: int = 900) -> S3UploadResult:
         async with self.session.client("s3", config=self.s3_config, **self.client_kwargs) as s3:
             try:
                 post_data = await s3.generate_presigned_post(
@@ -39,14 +48,17 @@ class S3Service:
                     ExpiresIn=expires_in,
                 )
                 public_url = f"{self.endpoint_url}/{self.bucket}/{object_name}"
-                return {"upload_data": post_data, "public_url": public_url}
+                return {
+                    "upload_data": {"url": str(post_data["url"]), "fields": dict(post_data["fields"])},
+                    "public_url": public_url,
+                }
             except Exception as e:
                 logger.error(f"Ошибка генерации параметров загрузки: {e}")
                 raise
 
     # --- МАССОВОЕ УДАЛЕНИЕ ПО ПРЕФИКСУ ---
 
-    async def delete_all_user_files(self, user_id: int, client=None) -> bool:
+    async def delete_all_user_files(self, user_id: int, client: S3Client | None = None) -> bool:
         """
         Находит и удаляет ВСЕ объекты в S3, в пути которых есть 'user_{id}/'.
         Это избавляет от необходимости дописывать новые поля при расширении профилей.
@@ -59,7 +71,7 @@ class S3Service:
         async with self.session.client("s3", config=self.s3_config, **self.client_kwargs) as s3:
             return await self._purge_by_marker(s3, marker)
 
-    async def _purge_by_marker(self, s3_client, marker: str) -> bool:
+    async def _purge_by_marker(self, s3_client: S3Client, marker: str) -> bool:
         """Логика поиска и пакетного удаления объектов."""
         try:
             # Используем пагинатор, так как файлов может быть больше 1000
@@ -67,8 +79,11 @@ class S3Service:
             found_any = False
 
             async for page in paginator.paginate(Bucket=self.bucket):
+                contents = page.get("Contents", [])
                 # Собираем ключи объектов, которые содержат наш маркер
-                objects_to_delete = [{"Key": obj["Key"]} for obj in page.get("Contents", []) if marker in obj["Key"]]
+                objects_to_delete: list[ObjectIdentifierTypeDef] = [
+                    {"Key": str(obj["Key"])} for obj in contents if obj.get("Key") and marker in str(obj["Key"])
+                ]
 
                 if objects_to_delete:
                     found_any = True
@@ -84,7 +99,7 @@ class S3Service:
 
     # --- КЛАССИЧЕСКОЕ УДАЛЕНИЕ ПО URL/KEY ---
 
-    async def delete_file_by_url(self, url: str, client=None) -> bool:
+    async def delete_file_by_url(self, url: str, client: S3Client | None = None) -> bool:
         try:
             bucket_marker = f"{self.bucket}/"
             if bucket_marker not in url:
@@ -95,13 +110,13 @@ class S3Service:
             logger.error(f"Не удалось распарсить URL для удаления: {url}. Ошибка: {e}")
             return False
 
-    async def delete_file(self, object_name: str, client=None) -> bool:
+    async def delete_file(self, object_name: str, client: S3Client | None = None) -> bool:
         if client:
             return await self._execute_delete(client, object_name)
         async with self.session.client("s3", config=self.s3_config, **self.client_kwargs) as s3:
             return await self._execute_delete(s3, object_name)
 
-    async def _execute_delete(self, s3_client, object_name: str) -> bool:
+    async def _execute_delete(self, s3_client: S3Client, object_name: str) -> bool:
         try:
             await s3_client.delete_object(Bucket=self.bucket, Key=object_name)
             logger.info(f"Объект S3 удален: {object_name}")

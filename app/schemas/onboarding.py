@@ -5,6 +5,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.admin import UserAdminView
+from app.schemas.base import ActionResponse
 
 
 class BankType(StrEnum):
@@ -29,6 +30,10 @@ class BankWebhookPayload(BaseModel):
         if not v.isdigit():
             raise ValueError("ИНН должен состоять только из цифр")
         return v
+
+
+class BankWebhookPayloadResponse(ActionResponse):
+    pass
 
 
 class SupplierSurvey(BaseModel):
@@ -167,7 +172,7 @@ class OnboardingAppShort(BaseModel):
     target_role: str
     inn: str | None
     bank_type: str | None
-    survey_payload: dict | None
+    survey_payload: SupplierSurvey | TripguideSurvey | None = None
     status: OnboardingStatus
     admin_comment: str | None = Field(None, alias="onboarding_error")
     created_at: datetime
@@ -177,6 +182,23 @@ class OnboardingAppShort(BaseModel):
 
 class RejectApplicationRequest(BaseModel):
     reason: str = Field(..., min_length=5, max_length=255, examples=["Плохое качество фото СТС"])
+
+
+class OnboardingLinkResponse(ActionResponse):
+    link: str
+
+
+class OnboardingUploadResponse(BaseModel):
+    upload_data: dict[str, str]
+    file_url: str
+
+
+class CancelCurrentApplicationResponse(ActionResponse):
+    pass
+
+
+class SubmitSurveyResponse(ActionResponse):
+    pass
 
 
 ROLE_SURVEY_SCHEMAS = {

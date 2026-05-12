@@ -1,6 +1,8 @@
 import asyncio
 import logging
 
+from celery import Task
+
 from app.core.dependencies.s3 import get_s3_service
 from app.infra.celery_app import celery_app
 from app.infra.db import async_session_maker
@@ -11,8 +13,8 @@ from app.services.user_service import UserService
 logger = logging.getLogger(__name__)
 
 
-@celery_app.task(name="cleanup_inactive_users_task")
-def cleanup_inactive_users_task():
+@celery_app.task(name="cleanup_inactive_users_task", base=Task)
+def cleanup_inactive_users_task() -> str | None:
     try:
         report = asyncio.run(run_cleanup())
         logger.info(f"ЕЖЕДНЕВНАЯ_ОЧИСТКА_ЗАВЕРШЕНА: {report}")
@@ -22,7 +24,7 @@ def cleanup_inactive_users_task():
         raise
 
 
-async def run_cleanup():
+async def run_cleanup() -> str:
     """Оркестратор очистки (Clean Architecture)."""
     async with async_session_maker() as session:
         # Инициализируем зависимости
