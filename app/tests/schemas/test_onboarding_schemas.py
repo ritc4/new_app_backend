@@ -24,7 +24,8 @@ class TestOnboardingSchemas:
     def valid_supplier_data(self):
         """Базовый набор валидных данных для анкеты."""
         return {
-            "car_model": "Kia Rio",
+            "car_brand": "Kia",
+            "car_model": "Rio",
             "car_year": datetime.now().year - 2,
             "car_number": "А777АА77",
             "car_color": "Белый",
@@ -32,6 +33,8 @@ class TestOnboardingSchemas:
             "license_expiry_date": date(2030, 1, 1),
             "experience_years": 5,
             "photo_selfie": "url",
+            "photo_car_side": "url",
+            "photo_car_interior": "url",
             "photo_car_front": "url",
             "photo_car_back": "url",
             "photo_sts_front": "url",

@@ -85,7 +85,8 @@ async def test_submit_survey(client, user_token):
 
     # Payload, который удовлетворяет ВСЕМ вашим валидаторам SupplierSurvey
     payload = {
-        "car_model": "Kia Rio",
+        "car_brand": "Kia",
+        "car_model": "Rio",
         "car_year": current_year - 2,  # Машина свежая (пройдет ge=1990 и < 15 лет)
         "car_number": "А777АА77",  # Только разрешенные буквы
         "car_color": "Белый",
@@ -95,11 +96,13 @@ async def test_submit_survey(client, user_token):
         "license_country": "RU",
         "experience_years": 5,  # Больше 3 лет
         "photo_selfie": "id_1",
-        "photo_car_front": "id_2",
-        "photo_car_back": "id_3",
-        "photo_sts_front": "id_4",
-        "photo_sts_back": "id_5",
-        "photo_license": "id_6",
+        "photo_car_side": "id_2",
+        "photo_car_interior": "id_3",
+        "photo_car_front": "id_4",
+        "photo_car_back": "id_5",
+        "photo_sts_front": "id_6",
+        "photo_sts_back": "id_7",
+        "photo_license": "id_8",
     }
     response = await client.post(f"{BASE_URL}/submit-survey", json=payload, headers=headers)
     assert response.status_code == 200

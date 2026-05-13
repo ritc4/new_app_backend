@@ -21,7 +21,7 @@ def get_mock_user_admin_view(role: UserRole = UserRole.CUSTOMER) -> dict[str, ob
         "role": role,
         "is_active": True,
         "created_at": now_iso,
-        "last_active": now_iso
+        "last_active": now_iso,
     }
 
 

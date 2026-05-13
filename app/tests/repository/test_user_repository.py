@@ -45,13 +45,16 @@ class TestUserRepository:
         # 2. Создаем профиль со всеми Not Null полями
         profile = SupplierProfile(
             user_id=user.id,
-            car_model="Tesla",
+            car_brand="Tesla",
+            car_model="Model 3",
             car_year=2024,
             car_number="A001AA",
             car_color="White",
             license_number="123456",
             license_expiry_date=date(2030, 1, 1),
             photo_selfie="url",
+            photo_car_side="url",
+            photo_car_interior="url",
             photo_car_front="url",
             photo_car_back="url",
             photo_sts_front="url",
@@ -71,7 +74,7 @@ class TestUserRepository:
         # можно явно обновить объект со связями, если сессия "потеряла" их
         # Но при правильно настроенном selectinload в репозитории, строка ниже должна работать:
         assert user_from_db.supplier_profile is not None
-        assert user_from_db.supplier_profile.car_model == "Tesla"
+        assert user_from_db.supplier_profile.car_model == "Model 3"
 
     @pytest.mark.parametrize(
         ("search_method", "field_name", "value"),

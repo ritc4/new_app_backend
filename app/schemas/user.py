@@ -102,6 +102,7 @@ class SupplierSchema(BaseModel):
     rating: float = Field(default=5.0, examples=[4.95])
 
     # Данные авто
+    car_brand: str = Field(..., examples=["Tesla"])
     car_model: str = Field(..., examples=["Tesla Model 3"])
     car_year: int = Field(..., examples=[2022])
     car_number: str = Field(..., examples=["А777АА77"])
@@ -115,6 +116,8 @@ class SupplierSchema(BaseModel):
 
     # Ссылки на фото (уже публичные URL из S3)
     photo_selfie: str = Field(...)
+    photo_car_side: str = Field(..., description="Фото авто с боковой стороны")
+    photo_car_interior: str = Field(..., description="Фото салона авто")
     photo_car_front: str = Field(...)
     photo_car_back: str = Field(...)
     photo_sts_front: str = Field(...)

@@ -65,7 +65,8 @@ async def test_submit_survey_without_legal_fails(client, user_token):
         "/api/v1/onboarding/submit-survey",
         headers={"Authorization": f"Bearer {user_token}"},
         json={
-            "car_model": "Tesla",
+            "car_brand": "Tesla",
+            "car_model": "Model 3",
             "car_year": 2022,
             "car_number": "Х777ХХ77",
             "car_color": "Белый",
@@ -73,6 +74,8 @@ async def test_submit_survey_without_legal_fails(client, user_token):
             "license_expiry_date": "2030-01-01",
             "experience_years": 5,
             "photo_selfie": "http://s3.com",
+            "photo_car_side": "http://s3.com",
+            "photo_car_interior": "http://s3.com",
             "photo_car_front": "http://s3.com",
             "photo_car_back": "http://s3.com",
             "photo_sts_front": "http://s3.com",
@@ -204,7 +207,8 @@ async def test_onboarding_to_supplier_conversion(
         "/api/v1/onboarding/submit-survey",
         headers={"Authorization": f"Bearer {user_token}"},
         json={
-            "car_model": "Tesla Model 3",
+            "car_brand": "Tesla",
+            "car_model": "Model 3",
             "car_year": 2022,
             "car_number": "Х777ХХ77",
             "car_color": "Белый",
@@ -214,6 +218,8 @@ async def test_onboarding_to_supplier_conversion(
             "license_country": "RU",
             "experience_years": 5,
             "photo_selfie": "http://s3.com",
+            "photo_car_side": "http://s3.com",
+            "photo_car_interior": "http://s3.com",
             "photo_car_front": "http://s3.com",
             "photo_car_back": "http://s3.com",
             "photo_sts_front": "http://s3.com",
@@ -235,7 +241,8 @@ async def test_onboarding_to_supplier_conversion(
     data = me_resp.json()
     print(f"DEBUG DATA: {data}")  # Посмотрите, что реально возвращает сервер
     assert data["user"]["role"] == "supplier"
-    assert data["supplier_data"]["car_model"] == "Tesla Model 3"
+    assert data["supplier_data"]["car_brand"] == "Tesla"
+    assert data["supplier_data"]["car_model"] == "Model 3"
 
 
 @pytest.mark.asyncio

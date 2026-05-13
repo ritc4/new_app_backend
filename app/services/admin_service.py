@@ -239,6 +239,7 @@ class AdminService:
                 self.db.add(
                     SupplierProfile(
                         user_id=app.user_id,
+                        car_brand=survey_sup.car_brand,
                         car_model=survey_sup.car_model,
                         car_year=survey_sup.car_year,
                         car_number=survey_sup.car_number,
@@ -249,6 +250,8 @@ class AdminService:
                         license_country=survey_sup.license_country,
                         experience_years=survey_sup.experience_years,
                         photo_selfie=survey_sup.photo_selfie,
+                        photo_car_side=survey_sup.photo_car_side,
+                        photo_car_interior=survey_sup.photo_car_interior,
                         photo_car_front=survey_sup.photo_car_front,
                         photo_car_back=survey_sup.photo_car_back,
                         photo_sts_front=survey_sup.photo_sts_front,

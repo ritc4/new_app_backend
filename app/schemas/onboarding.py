@@ -40,7 +40,8 @@ class SupplierSurvey(BaseModel):
     """Расширенная анкета водителя (Enterprise Standard)."""
 
     # --- Данные авто ---
-    car_model: str = Field(..., min_length=2, max_length=100, examples=["Kia Rio"])
+    car_brand: str = Field(..., min_length=2, max_length=50, examples=["Tesla"])
+    car_model: str = Field(..., min_length=2, max_length=100, examples=["Model 3"])
     car_year: int = Field(..., ge=1990, le=datetime.now().year + 1, description="Год выпуска авто")
     car_number: str = Field(..., min_length=6, max_length=15, examples=["А777АА77"])
     car_color: str = Field(..., min_length=2, max_length=30, examples=["Белый"])
@@ -55,6 +56,8 @@ class SupplierSurvey(BaseModel):
 
     # --- Фото-контроль ---
     photo_selfie: str = Field(..., description="Селфи водителя")
+    photo_car_side: str = Field(..., description="Фото авто с боковой стороны")
+    photo_car_interior: str = Field(..., description="Фото салона авто")
     photo_car_front: str = Field(..., description="Фото авто спереди")
     photo_car_back: str = Field(..., description="Фото авто сзади (видны номера)")
     photo_sts_front: str = Field(..., description="Фото СТС (лицевая)")
@@ -210,6 +213,8 @@ ROLE_SURVEY_SCHEMAS = {
 ROLE_ALLOWED_PHOTOS = {
     "supplier": {
         "photo_selfie",
+        "photo_car_side",
+        "photo_car_interior",
         "photo_car_front",
         "photo_car_back",
         "photo_sts_front",
