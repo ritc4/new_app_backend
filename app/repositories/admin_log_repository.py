@@ -30,4 +30,4 @@ class AdminLogRepository:
             stmt = stmt.where(AdminLog.admin_id == admin_id)
 
         res = await self.db.execute(stmt)
-        return res.scalars().all()
+        return res.scalars().all() 

@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
@@ -9,6 +10,8 @@ from app.schemas.onboarding import (
     BankWebhookPayload,
     BankWebhookPayloadResponse,
     CancelCurrentApplicationResponse,
+    GlobalLanguageResponse,
+    OnboardingCountryPickerResponse,
     OnboardingLinkResponse,
     OnboardingStart,
     OnboardingUploadResponse,
@@ -50,6 +53,34 @@ async def get_onboarding_link(
     content_type: Annotated[str, Query(description="MIME-тип (image/jpeg, image/png)")],
 ) -> OnboardingUploadResponse:
     return await service.get_onboarding_upload_url(user.id, file_type, content_type)
+
+
+@router.get(
+    "/guide-languages",
+    response_model=list[GlobalLanguageResponse],
+    summary="[Справочник] Список языков мира для анкеты гида (Яндекс-стайл)",
+    description="Вызывается Flutter перед открытием экрана анкеты. "
+    "Язык текущего пользователя автоматически встанет на позицию №1 в блоке популярных.",
+)
+async def get_guide_languages(
+    service: OnboardingServiceDep,
+    user: CurrentUserDep,  # Автоматический разбор JWT-токена пользователя
+) -> Sequence[GlobalLanguageResponse]:
+    # Прокидываем пользователя напрямую в бизнес-логику
+    return await service.get_all_world_languages(client_user=user)
+
+
+@router.get(
+    "/countries",
+    response_model=list[OnboardingCountryPickerResponse],
+    summary="[Справочник] Список стран для выбора в анкете водителя",
+    description="Вызывается Flutter при отрисовке экрана документов водителя для Dropdown-выбора страны прав.",
+)
+async def get_allowed_countries_for_picker(
+    service: OnboardingServiceDep,
+    user: CurrentUserDep,
+) -> Sequence[OnboardingCountryPickerResponse]:
+    return await service.get_allowed_countries_for_picker(client_user=user)
 
 
 @router.post("/submit-survey", summary="Отправить анкету", response_model=SubmitSurveyResponse)

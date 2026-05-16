@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.models.onboarding import OnboardingApplication
+from app.models.spatial import Country
 from app.schemas.onboarding import OnboardingStatus
 
 
@@ -116,3 +117,21 @@ class OnboardingRepository:
         result = await self.db.execute(stmt)
         count = getattr(result, "rowcount", 0)
         return bool(count and count > 0)
+
+    async def get_active_countries(self) -> Sequence[Country]:
+        """
+        Низкоуровневый SQL-запрос к PostgreSQL.
+        Ищет все активные страны и сортирует их по алфавиту.
+        """
+        stmt = select(Country).where(Country.is_active).order_by(Country.name.asc())
+        result = await self.db.execute(stmt)
+        return result.scalars().all()
+
+    async def get_country_iso_by_id(self, country_id: int) -> str | None:
+        """
+        Точечный атомарный запрос в СУБД.
+        Возвращает ISO-код страны по её первичному ключу.
+        """
+        stmt = select(Country.iso_code).where(Country.id == country_id)
+        res = await self.db.execute(stmt)
+        return res.scalar_one_or_none()

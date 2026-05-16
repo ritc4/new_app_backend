@@ -3,8 +3,6 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request
 
 from app.core.dependencies.auth import get_auth_service
-
-# from app.core.security import get_session_info
 from app.core.jwt import get_session_info
 from app.schemas.auth import (
     AppConfigResponse,

@@ -20,6 +20,7 @@ class UserBase(BaseModel):
 
     # Телефон маскируется, но пример показываем реальный для ясности формата
     phone: str = Field(..., examples=["+79620000096"], description="Маскированный номер телефона")
+    country_id: int = Field(..., description="ID страны регистрации пользователя по ISO стандарту")
 
     # Убираем кракозябры из Swagger, ставим понятный пример
     username: str | None = Field(None, examples=["user_a1b2c"], description="Уникальный технический никнейм")

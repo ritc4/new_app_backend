@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Sequence
 from uuid import UUID
 
 from sqlalchemy import and_, delete, select, update
@@ -7,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.sql import func
 
+from app.models.spatial import Country
 from app.models.user import User
 
 logger = logging.getLogger("app.infra.db")
@@ -59,7 +61,7 @@ class UserRepository:
         res = await self.db.execute(stmt)
         return res.scalar_one_or_none()
 
-    async def create_with_phone(self, phone: str, app_version: str, username: str) -> User:
+    async def create_with_phone(self, phone: str, app_version: str, username: str, country_id: int) -> User:
         """
         Создает пользователя или восстанавливает удаленного.
         Сохраняет права активных админов при входе.
@@ -72,6 +74,7 @@ class UserRepository:
             .values(
                 phone=phone,
                 username=username,
+                country_id=country_id,
                 is_email_verified=False,
                 is_active=True,
                 app_version=app_version,
@@ -82,6 +85,7 @@ class UserRepository:
                 index_elements=["phone"],
                 set_={
                     "username": User.username,
+                    "country_id": User.country_id,
                     "first_name": User.first_name,
                     "last_name": User.last_name,
                     "middle_name": User.middle_name,
@@ -135,6 +139,21 @@ class UserRepository:
         if not user:
             raise ValueError(f"Пользователь с ID {user_id} не найден для смены номера")
         return user
+
+    async def find_country_id_by_iso_code(self, iso_code: str) -> int | None:
+        """
+        Находит внутренний BigInt ID страны по её двухбуквенному международному коду (например, 'RU', 'KZ').
+        Используется в AuthService совместно с библиотекой phonenumbers.
+        """
+        stmt = select(Country.id).where(Country.iso_code == iso_code.upper(), Country.is_active.is_(True))
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_countries_page(self, limit: int, offset: int) -> Sequence[Country]:
+        """Низкоуровневая выборка списка всех стран с сортировкой от новых к старым."""
+        stmt = select(Country).order_by(Country.id.desc()).limit(limit).offset(offset)
+        res = await self.db.execute(stmt)
+        return res.scalars().all()
 
     async def get_by_phone_include_deleted(self, phone: str) -> User | None:
         """Поиск по телефону без фильтрации deleted_at."""

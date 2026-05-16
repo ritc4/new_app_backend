@@ -1,6 +1,5 @@
-import re
-
-from pydantic import BaseModel, Field, field_validator
+import phonenumbers
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.base import ActionResponse, UserBase, UserRole
 
@@ -20,21 +19,68 @@ class AdminActionResponse(ActionResponse):
     user: UserAdminView
 
 
+class CountryView(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+    id: int = Field(..., description="Сгенерированный СУБД числовой ID страны")
+    iso_code: str
+    name: str
+    currency: str
+    phone_code: str
+    license_regex: str
+    is_allowed_for_ru_onboarding: bool
+    is_active: bool
+
+
+class AdminCountryResponse(ActionResponse):
+    country: CountryView = Field(..., description="Полные данные созданной страны")
+
+
+class AdminCountryView(CountryView):
+    """Представление данных страны в общем списке админ-панели."""
+
+    pass
+
+
 class AdminChangePhoneRequest(BaseModel):
     new_phone: str = Field(
         ...,
-        description="Номер телефона в международном формате (от 7 до 15 цифр), например +79620001122",
+        description="Номер телефона в международном формате, например +79620001122",
     )
 
     @field_validator("new_phone")
     @classmethod
-    def validate_phone_international(cls, v: str) -> str:
-        # Паттерн: опциональный '+', первая цифра [1-9], затем от 6 до 14 цифр
-        international_pattern = r"^\+?[1-9]\d{6,14}$"
+    def validate_phone_via_libphonenumber(cls, v: str) -> str:
+        try:
+            # Парсим номер телефона
+            parsed_phone = phonenumbers.parse(v, None)
 
-        if not re.match(international_pattern, v):
-            raise ValueError(
-                "Некорректный формат номера. Используйте международный стандарт: "
-                "от 7 до 15 цифр. Номер должен начинаться с '+' или цифры от 1 до 9.",
-            )
-        return v
+            # Проверяем, существует ли такой номер в плане нумерации стран мира
+            if not phonenumbers.is_valid_number(parsed_phone):
+                raise ValueError("Данный номер телефона не существует или имеет неверную длину")
+
+            # Возвращаем строго отформатированную строку в формате E164 (+79620001122)
+            return phonenumbers.format_number(parsed_phone, phonenumbers.PhoneNumberFormat.E164)
+        except Exception as e:
+            if isinstance(e, ValueError):
+                raise e
+            raise ValueError("Неверный формат номера. Телефон должен начинаться с '+' и содержать код страны") from e
+
+
+class AdminCountryCreate(BaseModel):
+    iso_code: str = Field(
+        ..., min_length=2, max_length=2, description="ISO-код страны", examples=["RU", "KZ", "BY", "AE"]
+    )
+    name: str = Field(..., min_length=2, max_length=100, examples=["ОАЭ"])
+    currency: str = Field(..., min_length=3, max_length=3, examples=["AED"])
+    phone_code: str = Field(..., min_length=2, max_length=5, examples=["+971"])
+    license_regex: str = Field(r"^[0-9]{2,15}$", description="Регулярка для проверки прав новой страны")
+    is_allowed_for_ru_onboarding: bool = Field(
+        default=False, description="Разрешена ли работа в РФ по правам этой страны"
+    )
+    is_active: bool = Field(default=True)
+
+    @field_validator("iso_code")
+    @classmethod
+    def validate_iso(cls, v: str) -> str:
+        # Автоматически приводим к верхнему регистру "ae" -> "AE"
+        return v.upper().strip()

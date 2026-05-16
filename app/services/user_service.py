@@ -56,6 +56,8 @@ class UserService:
                 last_name=data.last_name,
             )
 
+            if not updated_user:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
             await self.db.commit()
             logger.info(f"Профиль User ID {user_id} успешно обновлен.")
             return RegistrationResponse(
@@ -115,6 +117,8 @@ class UserService:
 
             # Вызываем твой универсальный метод репозитория
             user = await self.users.update_user(user_id, **update_data)
+            if not user:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
             await self.db.commit()
 
             logger.info(f"User ID {user_id} обновил профиль в настройках: {list(update_data.keys())}")
@@ -138,6 +142,8 @@ class UserService:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "Ник занят")
 
             user = await self.users.update_user(user_id, username=username)
+            if not user:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
             await self.db.commit()
             logger.info(f"User ID {user_id} сменил ник на '{username}'")
             return UpdateUsernameResponse(
@@ -164,6 +170,8 @@ class UserService:
 
             # 2. Атомарное обновление через репозиторий
             user = await self.users.update_user(user_id=user_id, email=new_email, is_email_verified=False)
+            if not user:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
 
             await self.db.commit()
             logger.info(f"USER_EMAIL_CHANGED: ID {user_id} -> {new_email}. Status: Unverified.")
@@ -201,6 +209,8 @@ class UserService:
             final_url = s3_res["public_url"]
 
             await self.users.update_user(user.id, photo_url=final_url)
+            if not user:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
             await self.db.commit()
 
             if old_photo_url:
@@ -255,7 +265,8 @@ class UserService:
                 role=role_value,
                 is_superuser=False,
             )
-
+            if not updated_user:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
             await self.db.commit()
             await self.auth.logout_all(user.id)
 
@@ -286,7 +297,9 @@ class UserService:
 
         try:
             new_status = not user.is_available
-            await self.users.update_user(user.id, is_available=new_status)
+            updated_user = await self.users.update_user(user.id, is_available=new_status)
+            if not updated_user:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
             await self.db.commit()
 
             logger.info(f"User {user.id} (role: {user.role}) изменил статус на: {new_status}")
@@ -311,7 +324,6 @@ class UserService:
         logger.info("CLEANUP_STARTED: Запуск плановой очистки системы...")
         # --- ШАГ 1: Очистка старых анкет онбординга ---
         # Используем локальный импорт во избежание циклической зависимости
-        from app.repositories.onboarding_repository import OnboardingRepository
 
         onboarding_repo = OnboardingRepository(self.db)
         deleted_apps_count = await onboarding_repo.delete_expired_applications()

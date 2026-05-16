@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, Boolean, DateTime, String, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -12,6 +12,7 @@ from app.infra.db import Base
 
 # Решает ошибку F821 (Undefined name): импортируем только для линтеров
 if TYPE_CHECKING:
+    from .spatial import Country
     from .user_profiles import SupplierProfile, TripGuideProfile
 
 
@@ -48,6 +49,8 @@ class User(Base):
         comment="Подтвержден ли email",
     )
     phone: Mapped[str] = mapped_column(String(20), unique=True, index=True)
+    # Связь со страной регистрации (ISO стандарт для налогов и кодов телефонов)
+    country_id: Mapped[int] = mapped_column(ForeignKey("countries.id", ondelete="RESTRICT"), index=True)
     photo_url: Mapped[str | None] = mapped_column(String(500))
 
     # Статусы и роли
@@ -82,6 +85,7 @@ class User(Base):
 
     # Связи (Relationships)
     # Используем кавычки "SupplierProfile", чтобы не было ошибок импорта
+    country: Mapped[Country] = relationship("Country", back_populates="user", uselist=False)
     supplier_profile: Mapped[SupplierProfile | None] = relationship(
         "SupplierProfile",
         back_populates="user",

@@ -3,6 +3,7 @@ from typing import TypedDict
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+from app.models.spatial import CarClass
 from app.schemas.base import ActionResponse, UserBase
 
 
@@ -24,7 +25,7 @@ class UpdateProfileRequest(BaseModel):
     """Схема для обновления профиля."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
-    first_name: str | None = Field(None, pattern=r"^[^\s].*[^\s]$", min_length=2, max_length=100, examples=["Иван"])
+    first_name: str | None = Field(None, min_length=2, max_length=100, examples=["Иван"])
     last_name: str | None = Field(None, max_length=50, examples=["Иванов"])
     middle_name: str | None = Field(None, max_length=50, examples=["Иванович"])
 
@@ -99,30 +100,45 @@ class SupplierSchema(BaseModel):
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
-    rating: float = Field(default=5.0, examples=[4.95])
-
+    rating: float = Field(default=5.0, examples=[4.95], description="Рейтинг водителя")
+    base_region_id: int = Field(..., description="ID базового региона выполнения трансферов")
+    languages: list[str] = Field(
+        default_factory=list,
+        examples=[["RU", "EN"]],
+        description="Список кодов языков общения водителя по стандарту ISO 639-1",
+    )
     # Данные авто
-    car_brand: str = Field(..., examples=["Tesla"])
-    car_model: str = Field(..., examples=["Tesla Model 3"])
-    car_year: int = Field(..., examples=[2022])
-    car_number: str = Field(..., examples=["А777АА77"])
-    car_color: str = Field(..., examples=["Белый"])
-    vin_number: str | None = Field(None, examples=["1YVHP8CB123456789"])
+
+    # --- Данные авто ---
+    car_brand: str = Field(..., min_length=2, max_length=50, examples=["Tesla"])
+    car_model: str = Field(..., min_length=2, max_length=100, examples=["Model 3"])
+    car_class: CarClass = Field(
+        default=CarClass.ECONOMY, description="Класс автомобиля для расчета стоимости трансфера"
+    )
+    car_year: int = Field(..., ge=1990, le=datetime.now().year + 1, description="Год выпуска авто")
+    car_number: str = Field(..., min_length=6, max_length=15, examples=["А777АА77"])
+    car_color: str = Field(..., min_length=2, max_length=30, examples=["Белый"])
+    vin_number: str | None = Field(None, min_length=17, max_length=17, description="VIN-код")
 
     # Документы
-    license_number: str = Field(..., examples=["9901 123456"])
-    license_expiry_date: date = Field(...)
-    experience_years: int = Field(..., ge=0)
+    license_number: str = Field(..., examples=["9901 123456"], description="Номер водительского удостоверения")
+    license_expiry_date: date = Field(
+        ..., examples=["2022-01-01"], description="Дата окончания действия водительского удостоверения"
+    )
+    experience_years: int = Field(..., ge=0, le=60, examples=[5], description="Стаж водителя")
+    license_country: str = Field(
+        default="RU", min_length=2, max_length=2, description="Страна выдачи водительского удостоверения"
+    )
 
     # Ссылки на фото (уже публичные URL из S3)
     photo_selfie: str = Field(...)
     photo_car_side: str = Field(..., description="Фото авто с боковой стороны")
     photo_car_interior: str = Field(..., description="Фото салона авто")
-    photo_car_front: str = Field(...)
-    photo_car_back: str = Field(...)
-    photo_sts_front: str = Field(...)
-    photo_sts_back: str = Field(...)
-    photo_license: str = Field(...)
+    photo_car_front: str = Field(..., description="Фото авто спереди")
+    photo_car_back: str = Field(..., description="Фото авто сзади (видны номера)")
+    photo_sts_front: str = Field(..., description="Фото sts спереди")
+    photo_sts_back: str = Field(..., description="Фото sts сзади")
+    photo_license: str = Field(..., description="Фото водительского удостоверения")
 
 
 class TripguideSchema(BaseModel):
@@ -130,13 +146,14 @@ class TripguideSchema(BaseModel):
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
-    rating: float = Field(5.0)
-    languages: list[str] = Field(default_factory=list, examples=[["RU", "EN"]])
+    rating: float = Field(5.0, examples=[4.95], description="Рейтинг гида")
+    base_region_id: int = Field(..., description="ID домашнего региона проведения пеших экскурсий")
+    languages: list[str] = Field(default_factory=list, examples=[["RU", "EN"]], description="Список кодов языков")
 
     # Добавляем недостающие поля, чтобы они не пропадали
-    bio: str | None = Field(None, max_length=1000)
-    specialization: str | None = Field(None, max_length=255)
-    photo_certificate: str | None = Field(None)
+    bio: str | None = Field(None, max_length=1000, description="Описание гида")
+    specialization: str | None = Field(None, max_length=255, description="Специализация гида")
+    photo_certificate: str | None = Field(None, max_length=500, description="Ссылка на фото лицензии в S3")
 
 
 # --- 3. НОВОЕ: Итоговая "Матрешка" для /me ---

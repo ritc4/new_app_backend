@@ -2,6 +2,7 @@ import logging
 import secrets
 import uuid
 
+import phonenumbers
 from fastapi import HTTPException, Request, status
 from jose import JWTError, jwt
 from redis.asyncio import Redis
@@ -164,51 +165,84 @@ class AuthService:
     async def login_or_register(self, phone: str, request: Request) -> AuthResult:
         if settings.app.maintenance_mode:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="Тех. обслуживание")
-
         try:
             app_version = request.headers.get("X-App-Version", "1.0.0")
-            device, ip = get_session_info(request)  # Перенесли выше для логов
+            device, ip = get_session_info(request)
 
-            # 1. Ищем пользователя (проверка на "возвращенца")
-            existing_user = await self.users.get_by_phone_include_deleted(phone)
+            # 1. СТРОГАЯ НОРМАЛИЗАЦИЯ
+            try:
+                parsed_phone = phonenumbers.parse(phone, None)
+                if not phonenumbers.is_valid_number(parsed_phone):
+                    raise HTTPException(status.HTTP_400_BAD_REQUEST, "Некорректный номер телефона")
+                normalized_phone = phonenumbers.format_number(parsed_phone, phonenumbers.PhoneNumberFormat.E164)
+            except Exception:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "Неверный формат номера телефона") from None
+
+            # 2. Проверяем существование пользователя в базе данных (включая soft-deleted)
+            existing_user = await self.users.get_by_phone_include_deleted(normalized_phone)
             is_new = not bool(existing_user)
 
-            # 2. Генерируем временный ник (Бизнес-логика теперь здесь!)
-            # 8 символов UUID достаточно для 4 млрд комбинаций
-            temp_username = f"user_{str(uuid.uuid4())[:8]}"
+            # 3. ГЕО-ЛОГИКА: Определяем страну ТОЛЬКО если это новый или ранее удаленный пользователь
+            if is_new or (existing_user and existing_user.deleted_at):
+                # Получаем ISO-код страны (например: "RU", "KZ", "BY")
+                iso_code = phonenumbers.region_code_for_number(parsed_phone)
 
-            # 2. Создание или Восстановление (Upsert)
-            user = await self.users.create_with_phone(phone, app_version, username=temp_username)
+                # ИСПРАВЛЕНИЕ ОШИБКИ 1: Защита от None для MyPy
+                if not iso_code:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Не удалось определить регион для данного номера телефона",
+                    )
 
-            # 3. Проверка на бан
+                # Ищем ID страны в вашем репозитории по её ISO-коду
+                country_id = await self.users.find_country_id_by_iso_code(iso_code)
+                if not country_id:
+                    logger.warning(
+                        f"REGISTRATION_REJECTED: Unsupported country ISO '{iso_code}' for phone {normalized_phone}"
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Регистрация отклонена: регион ({iso_code}) не поддерживается платформой",
+                    )
+            else:
+                # ИСПРАВЛЕНИЕ ОШИБКИ 2: Явный тайп-гард для MyPy через проверку на существование объекта
+                if existing_user:
+                    country_id = existing_user.country_id
+                else:
+                    raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
+
+            # 4. Генерация username
+            if is_new:
+                temp_username = f"user_{str(uuid.uuid4())[:8]}"
+            else:
+                # ИСПРАВЛЕНИЕ ОШИБКИ 3: Явный тайп-гард для извлечения старого username
+                if existing_user:
+                    temp_username = existing_user.username or f"user_{str(uuid.uuid4())[:8]}"
+                else:
+                    temp_username = f"user_{str(uuid.uuid4())[:8]}"
+
+            # 5. Создание или Восстановление (Upsert) в базе данных
+            user = await self.users.create_with_phone(
+                phone=normalized_phone, app_version=app_version, username=temp_username, country_id=country_id
+            )
+
             if user.is_banned:
-                # В крупных компаниях при бане сессии не выдаются
-                logger.warning(f"BANNED_LOGIN_ATTEMPT: {phone} from {ip}")
+                logger.warning(f"BANNED_LOGIN_ATTEMPT: {normalized_phone} from {ip}")
                 raise HTTPException(status.HTTP_403_FORBIDDEN, "Аккаунт заблокирован")
 
             await self.db.commit()
 
-            # ЛОГИРОВАНИЕ (Улучшено для аналитики)
-            log_meta = f"Phone: {phone}, IP: {ip}, Ver: {app_version}"
-            if is_new:
-                logger.info(f"USER_REGISTERED: {log_meta}")
-            elif existing_user and existing_user.deleted_at:
-                logger.info(f"USER_RESTORED: {log_meta}")
-            else:
-                logger.info(f"USER_LOGIN: {log_meta}")
-
-            # 4. Генерация токенов
+            # 6. Генерация сессии и пары токенов
             access, refresh = await create_tokens(user, device, ip, self.redis)
-
             return AuthResult(access_token=access, refresh_token=refresh, is_new_user=is_new)
 
+        except HTTPException:
+            await self.db.rollback()
+            raise
         except Exception as e:
             await self.db.rollback()
-            if isinstance(e, HTTPException):
-                raise e
-            # В логах всегда указываем детали для отладки
             logger.error(f"AUTH_CRITICAL_ERROR: {phone} - {str(e)}", exc_info=True)
-            raise HTTPException(500, "Ошибка авторизации") from e
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Ошибка авторизации") from e
 
     # --- ВСПОМОГАТЕЛЬНЫЕ ПРИВАТНЫЕ МЕТОДЫ (Clean Code) ---
 

@@ -1,15 +1,24 @@
 import logging
+from collections.abc import Sequence
 from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.spatial import Country
 from app.models.user import User
 from app.models.user_profiles import SupplierProfile, TripGuideProfile
 from app.repositories.admin_log_repository import AdminLogRepository
 from app.repositories.onboarding_repository import OnboardingRepository
 from app.repositories.user_repository import UserRepository
-from app.schemas.admin import AdminActionResponse, UserAdminView
+from app.schemas.admin import (
+    AdminActionResponse,
+    AdminCountryCreate,
+    AdminCountryResponse,
+    AdminCountryView,
+    CountryView,
+    UserAdminView,
+)
 from app.schemas.base import UserRole
 from app.schemas.onboarding import OnboardingAppShort, SupplierSurvey, TripguideSurvey
 from app.services.auth_service import AuthService
@@ -239,6 +248,9 @@ class AdminService:
                 self.db.add(
                     SupplierProfile(
                         user_id=app.user_id,
+                        languages=survey_sup.languages,
+                        base_region_id=app.target_region_id,
+                        car_class=survey_sup.car_class,
                         car_brand=survey_sup.car_brand,
                         car_model=survey_sup.car_model,
                         car_year=survey_sup.car_year,
@@ -269,6 +281,7 @@ class AdminService:
                 self.db.add(
                     TripGuideProfile(
                         user_id=app.user_id,
+                        base_region_id=app.target_region_id,
                         bio=survey_guide.bio,
                         languages=survey_guide.languages,
                         specialization=survey_guide.specialization,
@@ -319,52 +332,159 @@ class AdminService:
     async def reject_partner_application(self, admin: User, application_id: int, reason: str) -> AdminActionResponse:
         """Отклонение заявки с указанием причины (Standard Яндекс)."""
         self._ensure_admin_access(admin)
-
         clean_reason = reason.strip()
         if not clean_reason:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Причина отклонения не может быть пустой")
 
         app = await self.onboarding.get_by_id(application_id)
-
-        # Проверяем статус: отклонить можно только то, что на модерации
         if not app or app.status != "on_moderation":
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Заявка не найдена или не находится на проверке")
 
         try:
             # 1. Меняем статус и записываем причину
             app.status = "rejected"
-            app.admin_comment = reason  # Тот самый текст для пользователя
+            app.admin_comment = clean_reason
 
-            # 2. Аудит для суперюзера (чтобы видеть, не банит ли админ всех подряд)
+            # 2. Аудит для суперюзера
             await self.log_repo.create_admin_log(
                 admin_id=admin.id,
                 target_id=app.user_id,
                 action="reject_onboarding",
-                details={"reason": reason, "app_id": application_id},
+                details={"reason": clean_reason, "app_id": application_id},
             )
-
             await self.db.commit()
 
-            # 3. Уведомление (опционально в будущем)
-            # await self.notifications.send_push(app.user_id, f"Заявка отклонена: {reason}")
             user = await self.repo.get_by_id(app.user_id)
+            # ИСПРАВЛЕНО: Добавлен тайп-гард защиты от None для MyPy
             if not user:
-                raise HTTPException(404, "Пользователь не найден")
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
 
-            logger.info(f"Админ {admin.id} отклонил заявку {application_id}. Причина: {reason}")
+            logger.info(f"Админ {admin.id} отклонил заявку {application_id}. Причина: {clean_reason}")
             return AdminActionResponse(
                 status="success",
                 message="Заявка отклонена, пользователю отправлено уведомление",
                 user=UserAdminView.model_validate(user),
             )
-
+        except HTTPException:
+            await self.db.rollback()
+            raise
         except Exception as e:
             await self.db.rollback()
-            logger.error(f"Ошибка при отклонении заявки {application_id}: {e}")
-            raise HTTPException(500, "Ошибка сохранения данных") from e
+            logger.error(f"Ошибка при отклонении заявки {application_id}: {e}", exc_info=True)
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Ошибка сохранения данных") from e
 
-    async def get_pending_applications(self, admin: User, limit: int = 20, offset: int = 0) -> list[OnboardingAppShort]:
+    async def get_pending_applications(
+        self, admin: User, limit: int = 20, offset: int = 0
+    ) -> Sequence[OnboardingAppShort]:
         """Получить очередь на модерацию."""
         self._ensure_admin_access(admin)
         applications = await self.onboarding.get_moderation_list(limit, offset)
         return [OnboardingAppShort.model_validate(app) for app in applications]
+
+    async def admin_add_new_country(self, admin: User, data: AdminCountryCreate) -> AdminCountryResponse:
+        """Динамическое добавление страны на маркетплейс с записью в аудит-лог."""
+        self._ensure_admin_access(admin)
+
+        # СТРОГАЯ СИНХРОНИЗАЦИЯ: Приводим ISO-коды к верхнему регистру для связки с phonenumbers
+        iso_upper = data.iso_code.upper().strip()
+        phone_code_clean = data.phone_code.replace(" ", "").strip()
+
+        try:
+            new_country = Country(
+                iso_code=iso_upper,
+                name=data.name.strip(),
+                currency=data.currency.upper().strip(),
+                phone_code=phone_code_clean,
+                license_regex=data.license_regex,
+                is_allowed_for_ru_onboarding=data.is_allowed_for_ru_onboarding,
+            )
+            self.db.add(new_country)
+            await self.db.flush()
+
+            # Лог пишется в ТУ ЖЕ транзакцию
+            await self.log_repo.create_admin_log(
+                admin_id=admin.id,
+                target_id=new_country.id,
+                action="add_new_country",
+                details={"iso_code": iso_upper, "country_name": data.name},
+            )
+
+            await self.db.commit()
+            logger.info(f"GEO_MARKET_ADDED: Админ {admin.id} добавил страну {data.name}")
+
+            return AdminCountryResponse(
+                status="success",
+                message="Страна успешно добавлена",
+                country=CountryView.model_validate(new_country),
+            )
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Ошибка создания страны: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Не удалось добавить страну (возможно, ISO-код дублируется)",
+            ) from e
+
+    async def toggle_country_activity(self, admin: User, country_id: int) -> AdminCountryResponse:
+        """Безопасное 'мягкое удаление' или включение страны на платформе."""
+        # 1. Проверяем права админа
+        self._ensure_admin_access(admin)
+
+        # 2. Ищем страну (вне блока try/except, так как отсутствие страны — это бизнес-логика, а не сбой БД)
+        country = await self.db.get(Country, country_id)
+        if not country:
+            raise HTTPException(status_code=404, detail="Указанная страна не найдена")
+
+        # Инвертируем статус
+        old_status = country.is_active
+        country.is_active = not old_status
+        action_name = "deactivate_country" if old_status else "activate_country"
+
+        # 3. Транзакционный блок для изменения статуса и логирования
+        try:
+            # Логируем действие в аудит-лог (в рамках текущей транзакции)
+            await self.log_repo.create_admin_log(
+                admin_id=admin.id,
+                target_id=country.id,
+                action=action_name,
+                details={
+                    "iso_code": country.iso_code,
+                    "country_name": country.name,
+                    "was_active": old_status,
+                    "is_active": country.is_active,
+                },
+            )
+
+            # Атомарно фиксируем изменение статуса страны и добавление лога
+            await self.db.commit()
+
+            # Обновляем состояние объекта из базы данных после коммита
+            await self.db.refresh(country)
+
+        except Exception as e:
+            # При любой ошибке (в логгере или БД) откатываем изменения статуса страны
+            await self.db.rollback()
+            # ИСПРАВЛЕНО: Логгер теперь пишет полный trace ошибки для разбора сбоев
+            logger.error(f"Ошибка при изменении статуса страны {country_id}: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Не удалось изменить статус страны из-за внутренней ошибки сервера",
+            ) from e
+
+        logger.info(f"COUNTRY_TOGGLE: Админ {admin.id} изменил статус страны {country.name} на {country.is_active}")
+        return AdminCountryResponse(
+            status="success",
+            message=f"Статус страны {country.name} успешно изменен. Текущая активность: {country.is_active}",
+            country=CountryView.model_validate(country),
+        )
+
+    async def admin_get_all_countries(self, admin: User, limit: int, offset: int) -> Sequence[AdminCountryView]:
+        """Бизнес-логика: Проверяет права и вручную мапит модели базы данных в DTO-схемы."""
+        self._ensure_admin_access(admin)
+
+        # 1. Получаем чистые ORM-модели из репозитория
+        countries_models = await self.repo.get_countries_page(limit=limit, offset=offset)
+
+        # 2. ИСПРАВЛЕНО: Вручную переводим объекты базы данных в Pydantic-схемы
+        # Метод model_validate() идеально сработает благодаря ConfigDict(from_attributes=True)
+        return [AdminCountryView.model_validate(country) for country in countries_models]

@@ -10,37 +10,28 @@ from app.infra.db import Base
 
 # Импорт для линтеров
 if TYPE_CHECKING:
+    from .spatial import CityRegion
     from .user import User
 
 
 class OnboardingApplication(Base):
-    """Очередь регистрации партнеров (водителей/гидов)."""
+    """Заявка на регистрацию партнера."""
 
     __tablename__ = "onboarding_applications"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, index=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), unique=True)
+    target_region_id: Mapped[int] = mapped_column(ForeignKey("city_regions.id", ondelete="RESTRICT"), index=True)
 
-    # Обязательные поля (без | None)
-    target_role: Mapped[str] = mapped_column(String(20))  # supplier / trip_guide
-    status: Mapped[str] = mapped_column(
-        String(20),
-        server_default="pending_legal",
-        default="pending_legal",
-    )  # pending_legal, filling_survey, on_moderation, approved, canceled
-
-    # Данные от банка (Optional)
-    bank_type: Mapped[str | None] = mapped_column(String(20))  # sber / t_bank
-    external_id: Mapped[str | None] = mapped_column(String(100))  # ID связки из банка
+    target_role: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20), server_default="pending_legal", default="pending_legal")
+    bank_type: Mapped[str | None] = mapped_column(String(20))
+    external_id: Mapped[str | None] = mapped_column(String(100))
     inn: Mapped[str | None] = mapped_column(String(12))
     admin_comment: Mapped[str | None] = mapped_column(String(255))
 
-    # Анкета (СТС машины или навыки гида)
-    # Используем dict | None для удобной работы с JSON-объектом
     survey_payload: Mapped[dict[str, object] | None] = mapped_column(JSON)
-
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    # Связь с User
-    # Используем Mapped["User"], SQLAlchemy сама сопоставит ForeignKey
     user: Mapped[User] = relationship("User", foreign_keys=[user_id])
+    target_region: Mapped[CityRegion] = relationship("CityRegion")

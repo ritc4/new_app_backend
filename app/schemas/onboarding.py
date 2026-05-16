@@ -2,8 +2,10 @@ import re
 from datetime import date, datetime
 from enum import StrEnum
 
+import pycountry
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.models.spatial import CarClass
 from app.schemas.admin import UserAdminView
 from app.schemas.base import ActionResponse
 
@@ -16,6 +18,7 @@ class BankType(StrEnum):
 class OnboardingStart(BaseModel):
     target_role: str  # supplier / trip_guide
     bank: BankType
+    target_region_id: int = Field(..., description="ID операционного региона (хаба) начала деятельности")
 
 
 class BankWebhookPayload(BaseModel):
@@ -39,18 +42,32 @@ class BankWebhookPayloadResponse(ActionResponse):
 class SupplierSurvey(BaseModel):
     """Расширенная анкета водителя (Enterprise Standard)."""
 
+    # --- Данные водителя ---
+    languages: list[str] = Field(
+        default_factory=lambda: ["RU"],
+        examples=[["RU", "EN"]],
+        description="Список языков, на которых водитель может общаться с пассажиром (ISO 639-1)",
+    )
+
     # --- Данные авто ---
     car_brand: str = Field(..., min_length=2, max_length=50, examples=["Tesla"])
     car_model: str = Field(..., min_length=2, max_length=100, examples=["Model 3"])
+    car_class: CarClass = Field(
+        default=CarClass.ECONOMY, description="Класс автомобиля для расчета стоимости трансфера"
+    )
     car_year: int = Field(..., ge=1990, le=datetime.now().year + 1, description="Год выпуска авто")
     car_number: str = Field(..., min_length=6, max_length=15, examples=["А777АА77"])
     car_color: str = Field(..., min_length=2, max_length=30, examples=["Белый"])
     vin_number: str | None = Field(None, min_length=17, max_length=17, description="VIN-код")
 
     # --- Документы ---
-    license_number: str = Field(..., min_length=8, max_length=20, examples=["9901 123456"])
-    license_expiry_date: date = Field(..., description="Дата окончания срока действия прав")
-    license_country: str = Field(default="RU", min_length=2, max_length=50, examples=["Страна выдачи прав"])
+    license_number: str = Field(
+        ..., min_length=8, max_length=20, examples=["9901 123456"], description="Номер водительского удостоверения"
+    )
+    license_expiry_date: date = Field(..., examples=["2022-01-01"], description="Дата окончания срока действия прав")
+    license_country: str = Field(
+        default="RU", min_length=2, max_length=2, description="Страна выдачи водительского удостоверения"
+    )
 
     experience_years: int = Field(..., ge=0, le=60)
 
@@ -65,6 +82,29 @@ class SupplierSurvey(BaseModel):
     photo_license: str = Field(..., description="Фото водительского удостоверения")
 
     # --- Валидаторы ---
+
+    @field_validator("languages")
+    @classmethod
+    def validate_and_normalize_languages(cls, v: list[str]) -> list[str]:
+        """Проверяет коды языков водителя по международному стандарту ISO 639-1."""
+        cleaned_langs = [lang.strip().upper() for lang in v if lang.strip()]
+        if not cleaned_langs:
+            raise ValueError("Список языков общения водителя не может быть пустым")
+
+        for lang_code in cleaned_langs:
+            iso_language = pycountry.languages.get(alpha_2=lang_code.lower())
+            if not iso_language:
+                raise ValueError(f"Код языка '{lang_code}' не существует в международном стандарте ISO 639-1")
+        return cleaned_langs
+
+    @field_validator("license_country")
+    @classmethod
+    def validate_and_uppercase_country(cls, v: str) -> str:
+        """
+        Автоматически превращает 'kz ' или 'ru' в строго валидные 'KZ' и 'RU'.
+        Защищает SQL-запросы в OnboardingService от пустых результатов.
+        """
+        return v.upper().strip()
 
     @field_validator("car_number")
     @classmethod
@@ -115,33 +155,6 @@ class SupplierSurvey(BaseModel):
             raise ValueError("Автомобиль старше 15 лет не допускается к работе")
         return self
 
-    @model_validator(mode="after")
-    def validate_license_format(self) -> "SupplierSurvey":
-        # 1. Приводим к верхнему регистру и убираем пробелы для чистоты
-        val = self.license_number.upper().replace(" ", "")
-        country = self.license_country.upper()
-
-        # 2. Словарь правил (Regex) для разных стран
-        patterns = {
-            "RU": r"^\d{10}$",  # РФ: 10 цифр (серия + номер)
-            "BY": r"^[1-9][A-Z]{2}\d{7}$",  # Беларусь: цифра, 2 буквы, 7 цифр
-            "KZ": r"^[A-Z]{2}\d{6,9}$",  # Казахстан: 2 буквы и цифры
-        }
-
-        # 3. Выполняем проверку, если страна есть в списке
-        if country in patterns:
-            if not re.match(patterns[country], val):
-                error_msg = {
-                    "RU": "Номер прав РФ должен состоять из 10 цифр",
-                    "BY": "Неверный формат прав Беларуси",
-                    "KZ": "Неверный формат прав Казахстана",
-                }.get(country, "Неверный формат номера прав")
-                raise ValueError(error_msg)
-
-        # Перезаписываем очищенное значение (без пробелов) обратно в модель
-        self.license_number = val
-        return self
-
     @field_validator("experience_years")
     @classmethod
     def validate_experience(cls, v: int) -> int:
@@ -150,13 +163,70 @@ class SupplierSurvey(BaseModel):
         return v
 
 
-class TripguideSurvey(BaseModel):
-    """Анкета гида (Шаг 3)."""
+class GlobalLanguageResponse(BaseModel):
+    """Схема элемента международного языкового справочника Яндекс-стайл."""
 
-    bio: str = Field(..., min_length=20, max_length=1000, description="Рассказ о себе и опыте")
-    languages: list[str] = Field(default_factory=list, examples=[["RU", "EN"]])
-    specialization: str = Field(..., examples=["Пешие походы", "История архитектуры"])
-    photo_certificate: str | None = None
+    code: str = Field(..., description="ISO 639-1 код в верхнем регистре (RU, EN)")
+    name: str = Field(..., description="Название языка")
+    is_popular: bool = Field(..., description="Флаг популярности для разделения блоков во Flutter")
+
+
+class OnboardingCountryPickerResponse(BaseModel):
+    """Схема элемента выпадающего списка стран для мобильного приложения Flutter."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    iso_code: str = Field(..., description="Двухбуквенный международный ISO-код страны (RU, KZ, BY)")
+    name: str = Field(..., description="Понятное название страны для отображения пользователю")
+    is_popular: bool = Field(..., description="Флаг популярности для разделения блоков во Flutter")
+
+
+class TripguideSurvey(BaseModel):
+    """Анкета гида (Шаг 3) с поддержкой глобального стандарта ISO 639-1."""
+
+    bio: str = Field(
+        ..., min_length=20, max_length=1000, description="Рассказ о себе, опыте, ключевых маршрутах и фишках"
+    )
+    languages: list[str] = Field(
+        default_factory=list,
+        examples=[["RU", "EN"]],
+        description="Список языков ведения экскурсий по международному стандарту ISO 639-1",
+    )
+    specialization: str = Field(..., min_length=2, max_length=255, examples=["Пешие походы"])
+    photo_certificate: str | None = Field(
+        None, min_length=10, max_length=500, description="Ссылка на фото лицензии в S3"
+    )
+
+    @field_validator("photo_certificate")
+    @classmethod
+    def validate_certificate_url(cls, v: str | None) -> str | None:
+        if v is not None:
+            v_clean = v.strip()
+            if not v_clean:
+                return None
+            return v_clean
+        return None
+
+    @field_validator("languages")
+    @classmethod
+    def validate_and_normalize_languages(cls, v: list[str]) -> list[str]:
+        """
+        ГЛОБАЛЬНАЯ ВАЛИДАЦИЯ: Проверяет коды языков по международному стандарту ISO 639-1.
+        Поддерживает работу приложения в любой точке мира.
+        """
+        # 1. Очищаем пробелы и переводим в верхний регистр (стандарт ISO)
+        cleaned_langs = [lang.strip().upper() for lang in v if lang.strip()]
+        if not cleaned_langs:
+            raise ValueError("Список поддерживаемых языков не может быть пустым")
+
+        # 2. ДИНАМИЧЕСКАЯ ПРОВЕРКА ПО МЕЖДУНАРОДНОМУ РЕЕСТРУ
+        for lang_code in cleaned_langs:
+            # pycountry ожидает коды в нижнем регистре для стандарта alpha_2 (ru, en)
+            iso_language = pycountry.languages.get(alpha_2=lang_code.lower())
+            if not iso_language:
+                raise ValueError(f"Код языка '{lang_code}' не существует в международном стандарте ISO 639-1")
+
+        return cleaned_langs
 
 
 class OnboardingStatus(StrEnum):
@@ -172,6 +242,7 @@ class OnboardingAppShort(BaseModel):
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
     id: int
     user_id: int
+    target_region_id: int = Field(..., description="ID операционного региона подачи заявки")
     target_role: str
     inn: str | None
     bank_type: str | None

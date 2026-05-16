@@ -1,4 +1,5 @@
-from pydantic import BaseModel, ConfigDict, Field
+import phonenumbers
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.base import ActionResponse
 from app.schemas.user import UserShort
@@ -13,13 +14,22 @@ class AppConfigResponse(BaseModel):
 
 
 class OTPRequest(BaseModel):
-    # Валидация формата телефона
     phone: str = Field(
-        ...,
-        pattern=r"^\+?[1-9]\d{1,14}$",
-        description="Телефон в формате 79001234567",
-        examples=["+79620000000"],
+        ..., description="Телефон в международном формате, например +79620000000", examples=["+79620000000"]
     )
+
+    @field_validator("phone")
+    @classmethod
+    def validate_and_normalize_phone(cls, v: str) -> str:
+        try:
+            parsed = phonenumbers.parse(v, None)
+            if not phonenumbers.is_valid_number(parsed):
+                raise ValueError("Данный номер телефона не существует")
+            return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+        except Exception as e:
+            if isinstance(e, ValueError):
+                raise e
+            raise ValueError("Номер должен начинаться со знака + и содержать код страны") from e
 
 
 class OTPResponse(ActionResponse):
@@ -30,13 +40,22 @@ class OTPResponse(ActionResponse):
 
 class OTPVerifyRequest(BaseModel):
     phone: str = Field(
-        ...,
-        pattern=r"^\+?[1-9]\d{1,14}$",
-        description="Телефон в формате 79001234567",
-        examples=["+79620000000"],
+        ..., description="Телефон в международном формате, например +79620000000", examples=["+79620000000"]
     )
-    # Оставляем только регулярку, если код всегда 4 цифры
     code: str = Field(..., pattern=r"^\d{4}$", examples=["7018"])
+
+    @field_validator("phone")
+    @classmethod
+    def validate_and_normalize_phone(cls, v: str) -> str:
+        try:
+            parsed = phonenumbers.parse(v, None)
+            if not phonenumbers.is_valid_number(parsed):
+                raise ValueError("Данный номер телефона не существует")
+            return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+        except Exception as e:
+            if isinstance(e, ValueError):
+                raise e
+            raise ValueError("Номер должен начинаться со знака + и содержать код страны") from e
 
 
 AUTH_STRATEGY = "bearer"
