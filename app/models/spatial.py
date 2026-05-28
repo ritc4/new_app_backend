@@ -1,9 +1,15 @@
+from __future__ import annotations
+
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.infra.db import Base
+
+if TYPE_CHECKING:
+    from app.models.user import User
 
 
 class CarClass(StrEnum):
@@ -11,6 +17,7 @@ class CarClass(StrEnum):
     COMFORT = "comfort"
     MINIVAN = "minivan"
     BUSINESS = "business"
+    JEEP = "jeep"
 
 
 class Country(Base):
@@ -29,6 +36,8 @@ class Country(Base):
     license_regex: Mapped[str] = mapped_column(String(255), default=r"^\d{10}$")
     is_active: Mapped[bool] = mapped_column(default=True, index=True)
 
+    users: Mapped[list[User]] = relationship("User", back_populates="country")
+
 
 class CityRegion(Base):
     """Операционные регионы деятельности (курортные зоны / города)."""
@@ -41,7 +50,7 @@ class CityRegion(Base):
     timezone: Mapped[str] = mapped_column(String(50), default="Europe/Moscow")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
-    country: Mapped[Country] = relationship("Country")
+    country: Mapped[Country] = relationship("Country", passive_deletes=True)
 
 
 class LocationHub(Base):
@@ -59,7 +68,7 @@ class LocationHub(Base):
     latitude: Mapped[float] = mapped_column(Float)
     longitude: Mapped[float] = mapped_column(Float)
 
-    region: Mapped[CityRegion] = relationship("CityRegion")
+    region: Mapped[CityRegion] = relationship("CityRegion", passive_deletes=True)
 
 
 class TransferRoute(Base):
@@ -77,9 +86,7 @@ class TransferRoute(Base):
 
     from_location: Mapped[LocationHub] = relationship("LocationHub", foreign_keys=[from_location_id])
     to_location: Mapped[LocationHub] = relationship("LocationHub", foreign_keys=[to_location_id])
-    prices: Mapped[list["RoutePrice"]] = relationship(
-        "RoutePrice", back_populates="route", cascade="all, delete-orphan"
-    )
+    prices: Mapped[list[RoutePrice]] = relationship("RoutePrice", back_populates="route", cascade="all, delete-orphan")
 
 
 class RoutePrice(Base):

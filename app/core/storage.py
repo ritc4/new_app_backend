@@ -9,11 +9,13 @@ class StoragePaths:
         return allowed_types.get(content_type, "bin")
 
     @staticmethod
-    def onboarding_doc(user_id: int, file_type: str, content_type: str) -> str:
-        """Путь: onboarding/user_1/photo_selfie_uuid.jpg"""
+    def onboarding_doc(user_id: int, user_uuid: str, file_type: str, content_type: str) -> str:
+        """
+        ИСПРАВЛЕНО: user_uuid передается снаружи (из БД/сессии), а не генерируется случайно!
+        Путь всегда стабилен для конкретного юзера: onboarding/user_1_56f02c1b.../photo_selfie.jpg
+        """
         ext = StoragePaths._get_ext(content_type)
-        file_uuid = uuid.uuid4().hex
-        return f"onboarding/user_{user_id}/{file_type}_{file_uuid}.{ext}"
+        return f"onboarding/tmp/user_{user_id}_{user_uuid}/{file_type}.{ext}"  
 
     @staticmethod
     def user_avatar(user_id: int, content_type: str) -> str:
@@ -21,3 +23,14 @@ class StoragePaths:
         ext = StoragePaths._get_ext(content_type)
         file_uuid = uuid.uuid4().hex
         return f"avatars/user_{user_id}/{file_uuid}.{ext}"
+    
+    @staticmethod
+    def excursion_gallery_photo(excursion_id: int, position_index: int, content_type: str) -> str:
+        """
+        Путь всегда стабилен для конкретной позиции в карусели экскурсии (0-9):
+        excursions/excursion_42/gallery_slot_0.jpg
+        """
+        ext = StoragePaths._get_ext(content_type)
+        # Страхуем индекс на уровне генерации пути
+        safe_index = min(max(0, position_index), 9)
+        return f"excursions/excursion_{excursion_id}/gallery_slot_{safe_index}.{ext}"

@@ -1,8 +1,8 @@
 """initial
 
-Revision ID: a347146f9c00
+Revision ID: 5535c0b62d3e
 Revises: 
-Create Date: 2026-05-15 00:12:58.602633
+Create Date: 2026-05-19 22:11:41.475409
 
 """
 from collections.abc import Sequence
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = 'a347146f9c00'
+revision: str = '5535c0b62d3e'
 down_revision: str | Sequence[str] | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
@@ -135,6 +135,7 @@ def upgrade() -> None:
     )
     with op.batch_alter_table('onboarding_applications', schema=None) as batch_op:
         batch_op.create_index(batch_op.f('ix_onboarding_applications_id'), ['id'], unique=False)
+        batch_op.create_index('ix_onboarding_applications_status_created_at', ['status', 'created_at'], unique=False)
         batch_op.create_index(batch_op.f('ix_onboarding_applications_target_region_id'), ['target_region_id'], unique=False)
 
     op.create_table('supplier_profiles',
@@ -247,6 +248,7 @@ def downgrade() -> None:
     op.drop_table('supplier_profiles')
     with op.batch_alter_table('onboarding_applications', schema=None) as batch_op:
         batch_op.drop_index(batch_op.f('ix_onboarding_applications_target_region_id'))
+        batch_op.drop_index('ix_onboarding_applications_status_created_at')
         batch_op.drop_index(batch_op.f('ix_onboarding_applications_id'))
 
     op.drop_table('onboarding_applications')

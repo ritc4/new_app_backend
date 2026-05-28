@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import TypedDict
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.models.spatial import CarClass
 from app.schemas.base import ActionResponse, UserBase
@@ -13,6 +13,10 @@ class UserShort(UserBase):
     @field_validator("phone", "email", mode="after")
     @classmethod
     def apply_masking(cls, v: str | None) -> str | None:
+        # Защита от AttributeError, если поле в базе равно NULL (None)
+        if v is None:
+            return None
+
         if not v or "****" in v:
             return v
         if "@" in v:
@@ -107,15 +111,13 @@ class SupplierSchema(BaseModel):
         examples=[["RU", "EN"]],
         description="Список кодов языков общения водителя по стандарту ISO 639-1",
     )
-    # Данные авто
-
     # --- Данные авто ---
     car_brand: str = Field(..., min_length=2, max_length=50, examples=["Tesla"])
     car_model: str = Field(..., min_length=2, max_length=100, examples=["Model 3"])
     car_class: CarClass = Field(
         default=CarClass.ECONOMY, description="Класс автомобиля для расчета стоимости трансфера"
     )
-    car_year: int = Field(..., ge=1990, le=datetime.now().year + 1, description="Год выпуска авто")
+    car_year: int = Field(..., ge=1990, description="Год выпуска авто")
     car_number: str = Field(..., min_length=6, max_length=15, examples=["А777АА77"])
     car_color: str = Field(..., min_length=2, max_length=30, examples=["Белый"])
     vin_number: str | None = Field(None, min_length=17, max_length=17, description="VIN-код")
@@ -140,12 +142,18 @@ class SupplierSchema(BaseModel):
     photo_sts_back: str = Field(..., description="Фото sts сзади")
     photo_license: str = Field(..., description="Фото водительского удостоверения")
 
+    @model_validator(mode="after")
+    def check_future_year(self) -> "SupplierSchema":
+        current_year = datetime.now().year
+        if self.car_year > current_year + 1:
+            raise ValueError(f"Год выпуска авто не может быть позже {current_year + 1}")
+        return self
+
 
 class TripguideSchema(BaseModel):
     """Данные только для гида."""
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
-
     rating: float = Field(5.0, examples=[4.95], description="Рейтинг гида")
     base_region_id: int = Field(..., description="ID домашнего региона проведения пеших экскурсий")
     languages: list[str] = Field(default_factory=list, examples=[["RU", "EN"]], description="Список кодов языков")
@@ -162,7 +170,6 @@ class FullProfileResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
     user: UserShort
-
     # Расширения. Если роль не совпадает, придет null
     admin_data: AdminSchema | None = None
     customer_data: CustomerSchema | None = None

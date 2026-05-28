@@ -6,6 +6,10 @@ from app.config.settings import settings
 CELERY_TASKS = [
     "app.workers.auth.tasks",
     "app.workers.users.tasks",
+    "app.workers.onboarding.tasks",
+    "app.workers.transfers.tasks",
+    "app.workers.excursions.tasks",
+    "app.workers.payments.tasks",
 ]
 
 celery_app = Celery(
@@ -28,14 +32,22 @@ celery_app.conf.update(
 # Разделение по очередям
 celery_app.conf.task_routes = {
     "send_flash_call": {"queue": "critical"},
+    "generate_payment_link_task": {"queue": "critical"},
+    "generate_excursion_payment_link_task": {"queue": "critical"},
+    "process_bank_refund_task": {"queue": "maintenance"},
+    "delete_user_s3_resources_task": {"queue": "maintenance"},
     "cleanup_inactive_users_task": {"queue": "maintenance"},
+    "cleanup_expired_onboarding_task": {"queue": "maintenance"},
 }
 
 # Расписание
 celery_app.conf.beat_schedule = {
-    "cleanup-nightly": {
+    "cleanup-onboarding-nightly": {
+        "task": "cleanup_expired_onboarding_task",
+        "schedule": crontab(hour=2, minute=0),  # Каждую ночь в 2:00
+    },
+    "cleanup-users-nightly": {
         "task": "cleanup_inactive_users_task",
-        # Запуск каждый день в 3:00 ночи
-        "schedule": crontab(hour=3, minute=0),
+        "schedule": crontab(hour=3, minute=0),  # Каждую ночь в 3:00
     },
 }

@@ -1,13 +1,15 @@
 import re
 from datetime import date, datetime
 from enum import StrEnum
+from typing import Literal
 
 import pycountry
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models.spatial import CarClass
 from app.schemas.admin import UserAdminView
-from app.schemas.base import ActionResponse
+from app.schemas.base import ActionResponse, UserRole
+from app.schemas.s3 import S3PresignedPost
 
 
 class BankType(StrEnum):
@@ -16,7 +18,9 @@ class BankType(StrEnum):
 
 
 class OnboardingStart(BaseModel):
-    target_role: str  # supplier / trip_guide
+    target_role: Literal[UserRole.SUPPLIER, UserRole.TRIP_GUIDE] = Field(
+        ..., description="Выбранная роль пользователя (доступны только исполнители)"
+    )
     bank: BankType
     target_region_id: int = Field(..., description="ID операционного региона (хаба) начала деятельности")
 
@@ -42,6 +46,8 @@ class BankWebhookPayloadResponse(ActionResponse):
 class SupplierSurvey(BaseModel):
     """Расширенная анкета водителя (Enterprise Standard)."""
 
+    role_type: Literal[UserRole.SUPPLIER] = UserRole.SUPPLIER
+
     # --- Данные водителя ---
     languages: list[str] = Field(
         default_factory=lambda: ["RU"],
@@ -55,7 +61,7 @@ class SupplierSurvey(BaseModel):
     car_class: CarClass = Field(
         default=CarClass.ECONOMY, description="Класс автомобиля для расчета стоимости трансфера"
     )
-    car_year: int = Field(..., ge=1990, le=datetime.now().year + 1, description="Год выпуска авто")
+    car_year: int = Field(..., ge=1990, description="Год выпуска авто")
     car_number: str = Field(..., min_length=6, max_length=15, examples=["А777АА77"])
     car_color: str = Field(..., min_length=2, max_length=30, examples=["Белый"])
     vin_number: str | None = Field(None, min_length=17, max_length=17, description="VIN-код")
@@ -149,8 +155,11 @@ class SupplierSurvey(BaseModel):
 
     @model_validator(mode="after")
     def check_car_age(self) -> "SupplierSurvey":
-        # Машина не старше 15 лет (Enterprise требование)
         current_year = datetime.now().year
+        # Добавляем динамическую защиту от слишком будущего года выпуска:
+        if self.car_year > current_year + 1:
+            raise ValueError(f"Год выпуска авто не может быть позже {current_year + 1}")
+
         if current_year - self.car_year > 15:
             raise ValueError("Автомобиль старше 15 лет не допускается к работе")
         return self
@@ -184,6 +193,8 @@ class OnboardingCountryPickerResponse(BaseModel):
 class TripguideSurvey(BaseModel):
     """Анкета гида (Шаг 3) с поддержкой глобального стандарта ISO 639-1."""
 
+    role_type: Literal[UserRole.TRIP_GUIDE] = UserRole.TRIP_GUIDE
+
     bio: str = Field(
         ..., min_length=20, max_length=1000, description="Рассказ о себе, опыте, ключевых маршрутах и фишках"
     )
@@ -200,12 +211,10 @@ class TripguideSurvey(BaseModel):
     @field_validator("photo_certificate")
     @classmethod
     def validate_certificate_url(cls, v: str | None) -> str | None:
-        if v is not None:
-            v_clean = v.strip()
-            if not v_clean:
-                return None
-            return v_clean
-        return None
+        if v is None:
+            return None
+        v_clean = v.strip()
+        return v_clean if v_clean else None
 
     @field_validator("languages")
     @classmethod
@@ -243,10 +252,10 @@ class OnboardingAppShort(BaseModel):
     id: int
     user_id: int
     target_region_id: int = Field(..., description="ID операционного региона подачи заявки")
-    target_role: str
+    target_role: UserRole = Field(..., description="Роль, на которую подана заявка")
     inn: str | None
-    bank_type: str | None
-    survey_payload: SupplierSurvey | TripguideSurvey | None = None
+    bank_type: BankType | None = None
+    survey_payload: SupplierSurvey | TripguideSurvey = Field(..., discriminator="role_type")
     status: OnboardingStatus
     admin_comment: str | None = Field(None, alias="onboarding_error")
     created_at: datetime
@@ -263,8 +272,10 @@ class OnboardingLinkResponse(ActionResponse):
 
 
 class OnboardingUploadResponse(BaseModel):
-    upload_data: dict[str, str]
-    file_url: str
+    upload_data: S3PresignedPost = Field(
+        ..., description="Данные для загрузки: url бакета и секретные поля авторизации"
+    )
+    file_url: str = Field(..., description="Будущая постоянная публичная ссылка на файл после загрузки")
 
 
 class CancelCurrentApplicationResponse(ActionResponse):
@@ -275,6 +286,44 @@ class SubmitSurveyResponse(ActionResponse):
     pass
 
 
+class OnboardingDraftResponse(BaseModel):
+    """
+    [ENTERPRISE STANDARD]: Финальная схема ответа черновика для мобильного приложения.
+    Содержит все бизнес-поля (регион, банк, ИНН) и полиморфный payload анкеты.
+    """
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    application_id: int = Field(..., description="ID текущей заявки в СУБД")
+    status: OnboardingStatus = Field(..., description="Текущий статус онбординга (например, filling_survey)")
+    target_role: UserRole = Field(..., description="Выбранная роль (supplier или trip_guide)")
+    target_region_id: int = Field(..., description="ID операционного региона (хаба) начала деятельности")
+
+    # ДОБАВЛЕНО ПОЛЕ БАНКА: Полная копия из OnboardingAppShort
+    bank_type: BankType | None = Field(None, description="Тип банка, выбранный для юридической привязки")
+
+    inn: str | None = Field(None, description="ИНН пользователя, верифицированный банком")
+
+    # Магия Pydantic v2 для полиморфного payload
+    payload: SupplierSurvey | TripguideSurvey | dict[str, object] = Field(
+        default_factory=dict, description="Данные частично заполненного черновика анкеты"
+    )
+
+
+class OnboardingFileType(StrEnum):
+    """Список всех типов файлов документов для онбординга."""
+
+    PHOTO_SELFIE = "photo_selfie"
+    PHOTO_CAR_SIDE = "photo_car_side"
+    PHOTO_CAR_INTERIOR = "photo_car_interior"
+    PHOTO_CAR_FRONT = "photo_car_front"
+    PHOTO_CAR_BACK = "photo_car_back"
+    PHOTO_STS_FRONT = "photo_sts_front"
+    PHOTO_STS_BACK = "photo_sts_back"
+    PHOTO_LICENSE = "photo_license"
+    PHOTO_CERTIFICATE = "photo_certificate"
+
+
 ROLE_SURVEY_SCHEMAS = {
     "supplier": SupplierSurvey,
     "trip_guide": TripguideSurvey,
@@ -282,15 +331,15 @@ ROLE_SURVEY_SCHEMAS = {
 
 
 ROLE_ALLOWED_PHOTOS = {
-    "supplier": {
-        "photo_selfie",
-        "photo_car_side",
-        "photo_car_interior",
-        "photo_car_front",
-        "photo_car_back",
-        "photo_sts_front",
-        "photo_sts_back",
-        "photo_license",
+    UserRole.SUPPLIER: {
+        OnboardingFileType.PHOTO_SELFIE,
+        OnboardingFileType.PHOTO_CAR_SIDE,
+        OnboardingFileType.PHOTO_CAR_INTERIOR,
+        OnboardingFileType.PHOTO_CAR_FRONT,
+        OnboardingFileType.PHOTO_CAR_BACK,
+        OnboardingFileType.PHOTO_STS_FRONT,
+        OnboardingFileType.PHOTO_STS_BACK,
+        OnboardingFileType.PHOTO_LICENSE,
     },
-    "trip_guide": {"photo_certificate"},
+    UserRole.TRIP_GUIDE: {OnboardingFileType.PHOTO_CERTIFICATE},
 }

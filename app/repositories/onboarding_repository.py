@@ -84,26 +84,6 @@ class OnboardingRepository:
         res = await self.db.execute(stmt)
         return res.scalars().all()
 
-    async def delete_expired_applications(self) -> int:
-        limit_approved = datetime.now(UTC) - timedelta(days=180)
-        limit_others = datetime.now(UTC) - timedelta(days=30)
-
-        stmt = delete(OnboardingApplication).where(
-            or_(
-                and_(
-                    OnboardingApplication.status == OnboardingStatus.APPROVED,
-                    OnboardingApplication.created_at < limit_approved,
-                ),
-                and_(
-                    OnboardingApplication.status != OnboardingStatus.APPROVED,
-                    OnboardingApplication.created_at < limit_others,
-                ),
-            ),
-        )
-        result = await self.db.execute(stmt)
-        count = getattr(result, "rowcount", 0)
-        return int(count)
-
     async def cancel_application(self, user_id: int) -> bool:
         """Отмена пользователем только тех заявок, что не на модерации."""
         stmt = (
@@ -133,5 +113,50 @@ class OnboardingRepository:
         Возвращает ISO-код страны по её первичному ключу.
         """
         stmt = select(Country.iso_code).where(Country.id == country_id)
+        res = await self.db.execute(stmt)
+        return res.scalar_one_or_none()
+    
+    async def get_country_by_iso(self, iso_code: str) -> Country | None:
+        """Точечный атомарный запрос в СУБД. Находит страну по её ISO-коду."""
+        stmt = select(Country).where(Country.iso_code == iso_code)
+        res = await self.db.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def get_expired_applications_with_payloads(self, limit: int = 500) -> Sequence[OnboardingApplication]:
+        """Находит строго ограниченную порцию просроченных заявок."""
+        limit_approved = datetime.now(UTC) - timedelta(days=180)
+        limit_others = datetime.now(UTC) - timedelta(days=30)
+        
+        stmt = (
+            select(OnboardingApplication)
+            .where(
+                or_(
+                    and_(
+                        OnboardingApplication.status == OnboardingStatus.APPROVED,
+                        OnboardingApplication.created_at < limit_approved,
+                    ),
+                    and_(
+                        OnboardingApplication.status != OnboardingStatus.APPROVED,
+                        # ЗАЩИТА: не трогаем тех, кто ждет проверки админа
+                        OnboardingApplication.status != OnboardingStatus.ON_MODERATION, 
+                        OnboardingApplication.created_at < limit_others,
+                    ),
+                )
+            )
+            .limit(limit) # ЗАЩИТА ОТ OOM: берем максимум 500 штук за одну ночь
+        )
+        res = await self.db.execute(stmt)
+        return res.scalars().all()
+
+    async def batch_delete_applications(self, application_ids: list[int]) -> None:
+        """Выполняет пакетное удаление просроченных заявок из БД."""
+        if not application_ids:
+            return
+        stmt = delete(OnboardingApplication).where(OnboardingApplication.id.in_(application_ids))
+        await self.db.execute(stmt)
+
+    async def get_any_by_user_id(self, user_id: int) -> OnboardingApplication | None:
+        """Находит абсолютно любую заявку по ID пользователя (колонке user_id)."""
+        stmt = select(OnboardingApplication).where(OnboardingApplication.user_id == user_id)
         res = await self.db.execute(stmt)
         return res.scalar_one_or_none()

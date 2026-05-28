@@ -12,6 +12,7 @@ from app.infra.db import Base
 
 # Решает ошибку F821 (Undefined name): импортируем только для линтеров
 if TYPE_CHECKING:
+    from .orders import Order
     from .spatial import Country
     from .user_profiles import SupplierProfile, TripGuideProfile
 
@@ -97,6 +98,12 @@ class User(Base):
         uselist=False,
     )
     current_session_id: str | None = None
+    client_orders: Mapped[list[Order]] = relationship(
+        "Order", foreign_keys="[Order.client_id]", back_populates="client"
+    )
+    performer_orders: Mapped[list[Order]] = relationship(
+        "Order", foreign_keys="[Order.performer_id]", back_populates="performer"
+    )
 
     @staticmethod
     def get_role_level(role: str, is_superuser: bool = False) -> int:

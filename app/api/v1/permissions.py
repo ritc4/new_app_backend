@@ -9,11 +9,16 @@ from app.core.dependencies.admin import get_admin_service
 from app.core.security import get_current_admin
 from app.models.user import User
 from app.schemas.admin import (
-    AdminActionResponse,
+    AdminApproveOnboardingResponse,
     AdminChangePhoneRequest,
+    AdminChangePhoneResponse,
     AdminCountryCreate,
     AdminCountryResponse,
     AdminCountryView,
+    AdminRejectOnboardingResponse,
+    AdminRoleChangeResponse,
+    AdminTargetRoleRequest,
+    AdminToggleBanResponse,
 )
 from app.schemas.base import UserRole
 from app.schemas.onboarding import OnboardingAppShort, RejectApplicationRequest
@@ -29,64 +34,64 @@ CurrentAdminDep = Annotated[User, Depends(get_current_admin)]
 @router.patch(
     "/role/{user_uuid}",
     summary="Изменить рабочую роль (Aдмин/Клиент)",
-    response_model=AdminActionResponse,
+    response_model=AdminRoleChangeResponse,
 )
 async def set_user_role(
     user_uuid: UUID,
-    role: UserRole,
     admin: CurrentAdminDep,
     service: AdminServiceDep,
-) -> AdminActionResponse:
-    return await service.set_user_role(admin, user_uuid, role)
+    role: AdminTargetRoleRequest,
+) -> AdminRoleChangeResponse:
+    return await service.set_user_role(admin, user_uuid, UserRole(role.value))
 
 
 @router.patch(
     "/ban/{user_uuid}",
     summary="Заблокировать/Разблокировать пользователя",
-    response_model=AdminActionResponse,
+    response_model=AdminToggleBanResponse,
 )
-async def toggle_user_ban(user_uuid: UUID, admin: CurrentAdminDep, service: AdminServiceDep) -> AdminActionResponse:
+async def toggle_user_ban(user_uuid: UUID, admin: CurrentAdminDep, service: AdminServiceDep) -> AdminToggleBanResponse:
     return await service.toggle_user_ban(admin, user_uuid)
 
 
 @router.post(
     "/change-phone/{user_uuid}",
     summary="Принудительная смена номера телефона пользователя",
-    response_model=AdminActionResponse,
+    response_model=AdminChangePhoneResponse,
 )
 async def admin_change_phone(
     user_uuid: UUID,
     data: AdminChangePhoneRequest,
     admin: CurrentAdminDep,
     service: AdminServiceDep,
-) -> AdminActionResponse:
+) -> AdminChangePhoneResponse:
     return await service.admin_change_phone(admin, user_uuid, data.new_phone)
 
 
 @router.patch(
     "/onboarding/{application_id}/approve",
     summary="Одобрить заявку партнера",
-    response_model=AdminActionResponse,
+    response_model=AdminApproveOnboardingResponse,
 )
 async def approve_onboarding(
     application_id: int,
     admin: CurrentAdminDep,
     service: AdminServiceDep,
-) -> AdminActionResponse:
+) -> AdminApproveOnboardingResponse:
     return await service.approve_partner_application(admin, application_id)
 
 
 @router.patch(
     "/onboarding/{application_id}/reject",
     summary="Отклонить заявку партнера",
-    response_model=AdminActionResponse,
+    response_model=AdminRejectOnboardingResponse,
 )
 async def reject_onboarding(
     application_id: int,
     data: RejectApplicationRequest,  # Обязательная причина
     admin: CurrentAdminDep,
     service: AdminServiceDep,
-) -> AdminActionResponse:
+) -> AdminRejectOnboardingResponse:
     return await service.reject_partner_application(admin, application_id, data.reason)
 
 
@@ -116,7 +121,7 @@ async def admin_add_new_country(
     admin: CurrentAdminDep,
     service: AdminServiceDep,
 ) -> AdminCountryResponse:
-    return await service.admin_add_new_country(admin, data)
+    return await service.admin_add_new_country(admin, data) 
 
 
 @router.patch(

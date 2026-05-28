@@ -8,6 +8,9 @@ from app.core.dependencies.s3 import get_s3_service
 from app.core.security import get_current_user
 from app.infra.db_depends import get_db
 from app.models.user import User
+from app.repositories.excursion_repository import ExcursionRepository
+from app.repositories.onboarding_repository import OnboardingRepository
+from app.repositories.user_repository import UserRepository
 from app.services.auth_service import AuthService
 from app.services.s3_service import S3Service
 from app.services.user_service import UserService
@@ -17,8 +20,23 @@ async def get_user_service(
     db: Annotated[AsyncSession, Depends(get_db)],
     s3_service: Annotated[S3Service, Depends(get_s3_service)],
     auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    # ИДЕАЛЬНО ДЛЯ FASTAPI: Фреймворк сам создаст ExcursionRepository, заглянув в его __init__ и передав туда db
 ) -> UserService:
-    return UserService(db=db, s3=s3_service, auth_service=auth_service)
+    """Промышленная фабрика зависимостей для UserService с явным внедрением через DI."""
+    # Создаем репозиторий пользователей на месте из сессии
+    user_repo = UserRepository(db=db)
+    excursion_repo = ExcursionRepository(db=db)
+    onboarding_repo = OnboardingRepository(db=db)
+
+    # Передаем абсолютно все зависимости снаружи через конструктор
+    return UserService(
+        db=db,
+        s3=s3_service,
+        auth_service=auth_service,
+        user_repo=user_repo,
+        excursion_repo=excursion_repo,
+        onboarding_repo=onboarding_repo,
+    )
 
 
 async def get_current_worker(user: Annotated[User, Depends(get_current_user)]) -> User:
@@ -32,6 +50,20 @@ async def get_current_worker(user: Annotated[User, Depends(get_current_user)]) -
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Эта функция доступна только для водителей и гидов",
         )
+    return user
+
+
+async def get_current_supplier(user: Annotated[User, Depends(get_current_worker)]) -> User:
+    """Разрешает доступ только исполнителям с ролью водителя (supplier)."""
+    if user.role != "supplier":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Эта функция доступна только для водителей")
+    return user
+
+
+async def get_current_guide(user: Annotated[User, Depends(get_current_worker)]) -> User:
+    """Разрешает доступ только исполнителям с ролью пешего гида (trip_guide)."""
+    if user.role != "trip_guide":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Эта функция доступна только для гидов")
     return user
 
 

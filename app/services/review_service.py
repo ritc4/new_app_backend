@@ -1,43 +1,61 @@
-# import logging
+import logging
 
-# from sqlalchemy import func, update
-# from sqlalchemy.ext.asyncio import AsyncSession
-# from sqlalchemy.future import select
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
 
-# from app.models.reviews import Review, ReviewTargetType
-# from app.models.user_profiles import SupplierProfile
+from app.models.orders import OrderStatus
+from app.models.reviews import OrderReview
+from app.repositories.review_repository import ReviewRepository
+from app.schemas.reviews import CreateReviewRequest, CreateReviewSuccessResponse, ReviewResponse
 
-# logger = logging.getLogger("app.services")
+logger = logging.getLogger("app.services.review")
 
 
-# class ReviewService:
-#     def __init__(self, db: AsyncSession) -> None:
-#         self.db = db
+class ReviewService:
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+        self.repo = ReviewRepository(db)
 
-#     async def add_review(
-#         self, author_id: int, target_type: ReviewTargetType, target_id: int, rating: int, comment: str
-#     ) -> None:
-#         # 1. Сохраняем отзыв в базу
-#         new_review = Review(
-#             author_id=author_id, target_type=target_type, target_id=target_id, rating=rating, comment=comment
-#         )
-#         self.db.add(new_review)
-#         await self.db.flush()
+    async def create_review(self, client_id: int, data: CreateReviewRequest) -> CreateReviewSuccessResponse:
+        """Универсальное создание отзывов без дублирования кода."""
+        order = await self.repo.get_order_with_context(data.order_id)
 
-#         # 2. Асинхронно пересчитываем средний рейтинг
-#         if target_type == ReviewTargetType.SUPPLIER:
-#             avg_rating = await self.db.scalar(
-#                 select(func.avg(Review.rating)).where(
-#                     Review.target_type == ReviewTargetType.SUPPLIER, Review.target_id == target_id
-#                 )
-#             )
+        if not order:
+            raise HTTPException(status_code=404, detail="Заказ не найден.")
+        if order.client_id != client_id:
+            raise HTTPException(status_code=403, detail="Вы не можете оценивать чужой заказ.")
+        if order.status != OrderStatus.COMPLETED:
+            raise HTTPException(status_code=400, detail="Оценить услугу можно только после её завершения.")
+        if not order.performer_id:
+            raise HTTPException(status_code=400, detail="На этот заказ не назначен исполнитель.")
 
-#             # Избегаем ошибки, если отзывов еще нет (avg_rating ис None)
-#             final_rating = round(float(avg_rating), 2) if avg_rating else 0.0
+        try:
+            # 1. Записываем отзыв
+            new_review = OrderReview(
+                order_id=order.id,
+                client_id=client_id,
+                performer_id=order.performer_id,
+                rating=data.rating,
+                comment=data.comment,
+            )
+            await self.repo.add_review(new_review)
+            await self.db.flush()
 
-#             # Обновляем кешированное поле в профиле
-#             await self.db.execute(
-#                 update(SupplierProfile).where(SupplierProfile.id == target_id).values(rating=final_rating)
-#             )
+            # 2. Вызываем атомарный пересчет в репозитории
+            await self.repo.calculate_and_update_rating_atomic(order)
 
-#         await self.db.commit()
+            await self.db.commit()
+            return CreateReviewSuccessResponse(
+                status="success",
+                message="Спасибо! Ваш отзыв успешно сохранен.",
+                review=ReviewResponse.model_validate(new_review),
+            )
+
+        except Exception as e:
+            await self.db.rollback()
+            from sqlalchemy.exc import IntegrityError
+
+            if isinstance(e, IntegrityError):
+                raise HTTPException(status_code=400, detail="Вы уже оставили отзыв на этот заказ.") from e
+            logger.error(f"Ошибка сохранения отзыва: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Не удалось сохранить отзыв.") from e

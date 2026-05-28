@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, String, func
+from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, Index, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.infra.db import Base
@@ -18,6 +18,8 @@ class OnboardingApplication(Base):
     """Заявка на регистрацию партнера."""
 
     __tablename__ = "onboarding_applications"
+
+    __table_args__ = (Index("ix_onboarding_applications_status_created_at", "status", "created_at"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, index=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), unique=True)

@@ -12,10 +12,14 @@ from app.repositories.admin_log_repository import AdminLogRepository
 from app.repositories.onboarding_repository import OnboardingRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.admin import (
-    AdminActionResponse,
+    AdminApproveOnboardingResponse,
+    AdminChangePhoneResponse,
     AdminCountryCreate,
     AdminCountryResponse,
     AdminCountryView,
+    AdminRejectOnboardingResponse,
+    AdminRoleChangeResponse,
+    AdminToggleBanResponse,
     CountryView,
     UserAdminView,
 )
@@ -64,7 +68,7 @@ class AdminService:
             if actor.level <= new_level:
                 raise HTTPException(403, "Вы не можете назначать роль равную или выше вашей")
 
-    async def set_user_role(self, admin: User, user_uuid: UUID, role: UserRole) -> AdminActionResponse:
+    async def set_user_role(self, admin: User, user_uuid: UUID, role: UserRole) -> AdminRoleChangeResponse:
         """Смена роли (Aдмин/Клиент). Сбрасывает сессии только при назначении/снятии админки."""
         self._ensure_admin_access(admin)
         user = await self.repo.get_by_uuid(user_uuid)
@@ -113,7 +117,7 @@ class AdminService:
                 logger.info(f"Сессии пользователя {user.id} сброшены (смена админ-прав)")
 
             logger.info(f"Админ {admin.id} установил роль {role} пользователю {user.id}")
-            return AdminActionResponse(
+            return AdminRoleChangeResponse(
                 status="success",
                 message=f"Пользователю {updated_user.phone} назначена роль {role}",
                 user=UserAdminView.model_validate(updated_user),
@@ -122,7 +126,7 @@ class AdminService:
             await self.db.rollback()
             raise HTTPException(500, "Ошибка при сохранении роли") from e
 
-    async def admin_change_phone(self, admin: User, user_uuid: UUID, new_phone: str) -> AdminActionResponse:
+    async def admin_change_phone(self, admin: User, user_uuid: UUID, new_phone: str) -> AdminChangePhoneResponse:
         """Принудительная смена номера телефона."""
         self._ensure_admin_access(admin)
         user = await self.repo.get_by_uuid(user_uuid)
@@ -150,7 +154,7 @@ class AdminService:
             await self.db.commit()
             await self.auth.logout_all(user.id)
             logger.info(f"Админ {admin.id} сменил номер для User {user.id} на {new_phone}")
-            return AdminActionResponse(
+            return AdminChangePhoneResponse(
                 status="success",
                 message=f"Номер пользователя {updated_user.uuid} изменен на {new_phone}",
                 user=UserAdminView.model_validate(updated_user),
@@ -175,7 +179,7 @@ class AdminService:
         if not admin.is_active:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Аккаунт администратора неактивен")
 
-    async def toggle_user_ban(self, admin: User, user_uuid: UUID) -> AdminActionResponse:
+    async def toggle_user_ban(self, admin: User, user_uuid: UUID) -> AdminToggleBanResponse:
         """Блокировка или разблокировка пользователя."""
         self._ensure_admin_access(admin)
 
@@ -217,7 +221,7 @@ class AdminService:
             # 6. Возвращаем результат
             status_ru = "заблокирован" if new_ban_status else "разблокирован"
 
-            return AdminActionResponse(
+            return AdminToggleBanResponse(
                 message=f"Пользователь {updated_user.phone} успешно {status_ru}",
                 is_banned=new_ban_status,  # Можно оставить для удобства фронта
                 user=UserAdminView.model_validate(updated_user),
@@ -228,7 +232,7 @@ class AdminService:
             logger.error(f"Ошибка при смене статуса бана User {user.id}: {e}")
             raise HTTPException(500, "Ошибка при изменении статуса блокировки") from e
 
-    async def approve_partner_application(self, admin: User, application_id: int) -> AdminActionResponse:
+    async def approve_partner_application(self, admin: User, application_id: int) -> AdminApproveOnboardingResponse:
         """Одобрение партнера: перенос данных в профиль и смена роли."""
         self._ensure_admin_access(admin)
 
@@ -316,7 +320,7 @@ class AdminService:
 
             logger.info(f"Админ {admin.id} одобрил партнера {app.user_id} ({app.target_role})")
 
-            return AdminActionResponse(
+            return AdminApproveOnboardingResponse(
                 status="success",
                 message="Партнер успешно активирован и профиль создан",
                 user=UserAdminView.model_validate(updated_user),
@@ -329,7 +333,9 @@ class AdminService:
             logger.error(f"Критическая ошибка активации {application_id}: {e}")
             raise HTTPException(500, "Ошибка при сохранении профиля партнера") from e
 
-    async def reject_partner_application(self, admin: User, application_id: int, reason: str) -> AdminActionResponse:
+    async def reject_partner_application(
+        self, admin: User, application_id: int, reason: str
+    ) -> AdminRejectOnboardingResponse:
         """Отклонение заявки с указанием причины (Standard Яндекс)."""
         self._ensure_admin_access(admin)
         clean_reason = reason.strip()
@@ -360,10 +366,12 @@ class AdminService:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
 
             logger.info(f"Админ {admin.id} отклонил заявку {application_id}. Причина: {clean_reason}")
-            return AdminActionResponse(
+            return AdminRejectOnboardingResponse(
                 status="success",
                 message="Заявка отклонена, пользователю отправлено уведомление",
                 user=UserAdminView.model_validate(user),
+                application_id=application_id,
+                reason=clean_reason,
             )
         except HTTPException:
             await self.db.rollback()
@@ -384,6 +392,13 @@ class AdminService:
     async def admin_add_new_country(self, admin: User, data: AdminCountryCreate) -> AdminCountryResponse:
         """Динамическое добавление страны на маркетплейс с записью в аудит-лог."""
         self._ensure_admin_access(admin)
+
+        existing_country = await self.onboarding.get_country_by_iso(data.iso_code) 
+        if existing_country:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Страна с ISO-кодом '{data.iso_code}' уже зарегистрирована в системе."
+            )
 
         # СТРОГАЯ СИНХРОНИЗАЦИЯ: Приводим ISO-коды к верхнему регистру для связки с phonenumbers
         iso_upper = data.iso_code.upper().strip()
@@ -415,14 +430,14 @@ class AdminService:
             return AdminCountryResponse(
                 status="success",
                 message="Страна успешно добавлена",
-                country=CountryView.model_validate(new_country),
+                country=CountryView.model_validate(new_country), 
             )
         except Exception as e:
             await self.db.rollback()
             logger.error(f"Ошибка создания страны: {str(e)}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Не удалось добавить страну (возможно, ISO-код дублируется)",
+                detail="Не удалось добавить страну (возможно, ISO-код дублируется)", 
             ) from e
 
     async def toggle_country_activity(self, admin: User, country_id: int) -> AdminCountryResponse:

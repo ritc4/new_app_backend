@@ -4,11 +4,11 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.storage import StoragePaths
 from app.models.user import User
+from app.repositories.excursion_repository import ExcursionRepository
 from app.repositories.onboarding_repository import OnboardingRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import CompleteRegistrationRequest, RegistrationResponse
@@ -32,19 +32,28 @@ from app.services.auth_service import AuthService
 from app.services.s3_service import S3Service
 
 if TYPE_CHECKING:
-    from types_aiobotocore_s3 import S3Client
+    pass
 
 # Иерархическое имя логгера для Enterprise-мониторинга
 logger = logging.getLogger("app.services.user")
 
 
 class UserService:
-    def __init__(self, db: AsyncSession, s3: S3Service, auth_service: AuthService) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        s3: S3Service,
+        auth_service: AuthService,
+        user_repo: UserRepository,
+        excursion_repo: ExcursionRepository,
+        onboarding_repo: OnboardingRepository,
+    ) -> None:
         self.db = db
         self.s3 = s3
         self.auth = auth_service
-        self.users = UserRepository(db)
-        self.onboarding = OnboardingRepository(db)
+        self.users = user_repo
+        self.excursions = excursion_repo
+        self.onboarding = onboarding_repo
 
     async def complete_registration(self, user_id: int, data: CompleteRegistrationRequest) -> RegistrationResponse:
         """Завершение регистрации с фиксацией транзакции."""
@@ -208,9 +217,10 @@ class UserService:
             s3_res = await self.s3.get_upload_params(object_name, content_type)
             final_url = s3_res["public_url"]
 
-            await self.users.update_user(user.id, photo_url=final_url)
-            if not user:
+            updated_user = await self.users.update_user(user.id, photo_url=final_url)
+            if not updated_user:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
+
             await self.db.commit()
 
             if old_photo_url:
@@ -290,111 +300,129 @@ class UserService:
 
     async def toggle_work_status(self, user: User) -> AvailabilityResponse:
         """Переключает статус: доступен для заказов / занят (офлайн)."""
-        # БИЗНЕС-ПРАВИЛО: Кнопка работает только для тех, у кого уровень доступа 20 (воркеры)
-        # Админам (50) и Суперюзерам (100) тоже разрешаем для тестов
-        if user.level < 20:
-            raise HTTPException(status_code=403, detail="Только исполнители услуг могут менять статус доступности")
 
+        # 1. ПРОВЕРКА ДОСТУПА (Бизнес-правило ролей)
+        if user.level < 20:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Только исполнители услуг могут менять статус доступности"
+            )
+
+        # 2. ПРОВЕРКА АКТИВНОЙ РАБОТЫ (Бизнес-правило маркетплейса)
+        # Если воркер СЕЙЧАС на линии (user.is_available == True) и хочет уйти (станет False)
+        if user.is_available:
+            # Делегируем SQL-запрос репозиторию
+            has_work = await self.users.has_active_orders(user.id)
+            if has_work:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Нельзя уйти с линии, пока у вас есть активный или назначенный заказ!",
+                )
+
+        # 3. ТРАНЗАКЦИОННОЕ ОБНОВЛЕНИЕ
         try:
             new_status = not user.is_available
+
+            # Вызываем ваш существующий метод обновления юзера в репозитории
             updated_user = await self.users.update_user(user.id, is_available=new_status)
             if not updated_user:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "Пользователь не найден")
-            await self.db.commit()
 
+            await self.db.commit()
             logger.info(f"User {user.id} (role: {user.role}) изменил статус на: {new_status}")
+
+            # 4. СИНХРОНИЗАЦИЯ С ОПЕРАТИВНЫМ КЭШЕМ (Бизнес-логика инфраструктуры)
+            # Если водитель ушел с линии — полностью стираем его из Redis GEO
+            if not new_status:
+                from app.infra.redis import redis_pool
+
+                await redis_pool.delete(f"driver_location:{user.id}")
+                await redis_pool.delete(f"driver_active_status:{user.id}")
+
             status_text = "На работе" if new_status else "Отдыхаю"
             return AvailabilityResponse(
                 status="success",
                 message=f"Ваш статус изменен на: {status_text}",
                 is_available=new_status,
             )
+
         except Exception as e:
             await self.db.rollback()
+            if isinstance(e, HTTPException):
+                raise e
             logger.error(f"Ошибка переключения статуса User {user.id}: {e}")
-            raise HTTPException(500, "Ошибка обновления статуса") from e
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Ошибка обновления статуса на сервере"
+            ) from e
 
-    async def perform_full_cleanup(self) -> str:
+    async def purge_abandoned_and_deleted_users(self) -> str:
         """
-        Комплексная очистка системы (Enterprise стандарт):
-        1. Удаление старых временных анкет (Onboarding).
-        2. Удаление заброшенных и помеченных на удаление аккаунтов.
-        3. Очистка ресурсов (S3 + Redis) для удаляемых пользователей.
+        Полная автоматическая зачистка просроченных и брошенных аккаунтов.
+        Абсолютно чистая архитектура: СУБД-запросы полностью делегированы репозиторию.
         """
-        logger.info("CLEANUP_STARTED: Запуск плановой очистки системы...")
-        # --- ШАГ 1: Очистка старых анкет онбординга ---
-        # Используем локальный импорт во избежание циклической зависимости
+        logger.info("USER_CLEANUP_STARTED: Поиск кандидатов на удаление аккаунтов...")
 
-        onboarding_repo = OnboardingRepository(self.db)
-        deleted_apps_count = await onboarding_repo.delete_expired_applications()
-
-        # --- ШАГ 2: Поиск кандидатов на удаление аккаунта ---
         abandoned_date = datetime.now(UTC) - timedelta(days=180)
         soft_deleted_date = datetime.now(UTC) - timedelta(days=30)
 
-        stmt = select(User.id).where(
-            and_(
-                User.is_superuser.is_(False),  # Никогда не удаляем суперюзеров
-                or_(
-                    # Условие для недореганных (брошенных на старте)
-                    (User.first_name.is_(None) & (User.last_active < abandoned_date)),
-                    # Условие для тех, кто сам нажал "Удалить"
-                    (User.deleted_at.is_not(None) & (User.deleted_at < soft_deleted_date)),
-                ),
-            ),
+        # 1. Запрашиваем кандидатов через репозиторий
+        expired_users = await self.users.get_expired_and_abandoned_users(
+            abandoned_date=abandoned_date, soft_deleted_date=soft_deleted_date
         )
 
-        res = await self.db.execute(stmt)
-        users_to_purge = res.scalars().all()
+        if not expired_users:
+            return "Пользователей для удаления не найдено."
 
-        # Если чистить нечего — выходим быстро
-        if not users_to_purge and deleted_apps_count == 0:
-            logger.info("CLEANUP_SKIPPED: Нет данных для удаления.")
-            return "Очистка завершена: новых данных для удаления нет."
+        user_ids_to_delete: list[int] = []
+        user_prefixes_to_delete: list[str] = []
 
-        total_users = len(users_to_purge)
-        batch_size = 100
-        purged_ids: list[int] = []
+        # Накапливаем стабильные префиксы папок согласно вашему StoragePaths
+        for user in expired_users:
+            u_id = user.id
+            u_uuid = str(user.uuid)
+            user_ids_to_delete.append(u_id)
 
-        # --- ШАГ 3: Очистка внешних ресурсов (S3 + Redis) ---
-        # Используем один S3 клиент (Keep-Alive) для всей пачки
-        async with self.s3.session.client("s3", config=self.s3.s3_config, **self.s3.client_kwargs) as s3_client:
-            for i in range(0, total_users, batch_size):
-                batch = users_to_purge[i : i + batch_size]
+            user_prefixes_to_delete.append(f"avatars/user_{u_id}/")
+            user_prefixes_to_delete.append(f"onboarding/tmp/user_{u_id}_{u_uuid}/")
 
-                # Запускаем задачи очистки для текущего батча
-                cleanup_tasks = [self._purge_resources_by_data(user_id, s3_client) for user_id in batch]
-                # return_exceptions=True чтобы ошибка одного юзера не остановила весь процесс
-                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        # 2. Собираем ID всех экскурсий удаляемых гидов через репозиторий (до очистки каскадов БД)
+        excursion_ids = await self.excursions.get_excursion_ids_by_guides(user_ids_to_delete)
 
-                purged_ids.extend(batch)
+        for exc_id in excursion_ids:
+            user_prefixes_to_delete.append(f"excursions/excursion_{exc_id}/")
 
-        # --- ШАГ 4: Окончательное удаление из БД ---
-        if purged_ids:
-            # Каскадное удаление (ondelete="CASCADE") само очистит связанные профили
-            await self.db.execute(delete(User).where(User.id.in_(purged_ids)))
+        # 3. Принудительный логаут сессий в Redis пачками по 100 штук
+        redis_batch_size = 100
+        for i in range(0, len(user_ids_to_delete), redis_batch_size):
+            batch_ids = user_ids_to_delete[i : i + redis_batch_size]
+            logout_tasks = [self.auth.logout_all(u_id) for u_id in batch_ids]
+            await asyncio.gather(*logout_tasks, return_exceptions=True)
 
-        # Фиксируем все изменения (и анкеты, и пользователей)
+        # 4. Полное каскадное удаление пользователей из PostgreSQL пачками по 500 штук
+        db_batch_size = 500
+        for i in range(0, len(user_ids_to_delete), db_batch_size):
+            chunk_ids = user_ids_to_delete[i : i + db_batch_size]
+            await self.users.delete_users_permanently_batch(chunk_ids)
+            await self.db.flush()
+
+        # Фиксируем изменения в PostgreSQL. Транзакция СУБД закрыта и безопасна
         await self.db.commit()
 
-        report = f"Удалено анкет: {deleted_apps_count}, удалено пользователей: {len(purged_ids)}"
-        logger.info(f"FULL_CLEANUP_SUCCESS: {report}")
-        return report
+        # 5. ДЕЛЕГИРОВАНИЕ КЛИНИНГ-НАГРУЗКИ В CELERY (Выполняется строго после commit)
+        if user_prefixes_to_delete:
+            from app.workers.users.tasks import delete_user_s3_resources_task
 
-    async def _purge_resources_by_data(self, user_id: int, s3_client: "S3Client") -> None:
-        """Очистка всех ресурсов пользователя (Redis + ВСЕ файлы S3)."""
-        # 1. Инвалидация всех сессий в Redis
-        # 2. Удаление всех файлов из S3, где в пути есть 'user_{id}/'
-        tasks = [self.auth.logout_all(user_id), self.s3.delete_all_user_files(user_id, client=s3_client)]
+            delete_user_s3_resources_task.delay(user_prefixes_to_delete)
 
-        # return_exceptions=True гарантирует, что если у юзера не было файлов в S3,
-        # процесс не прервется ошибкой.
-        await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info(
+                f"CELERY_CLEANUP_DISPATCHED: {len(user_prefixes_to_delete)} префиксов папок "
+                f"переданы в Celery для пользователей: {user_ids_to_delete}"
+            )
+
+        return f"Успешно удалено аккаунтов из СУБД: {len(user_ids_to_delete)}. Фоновая зачистка S3 запущена."
 
     async def _delete_old_s3_object_safe(self, url: str) -> None:
-        """Делегируем парсинг и удаление профильному сервису."""
+        """Делегируем парсинг и удаление профильному сервису (остается без изменений)."""
         try:
-            # S3Service уже знает, как извлечь ключ из URL
             await self.s3.delete_file_by_url(url)
             logger.debug(f"Старый объект S3 удален: {url}")
         except Exception as e:

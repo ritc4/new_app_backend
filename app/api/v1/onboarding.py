@@ -12,6 +12,8 @@ from app.schemas.onboarding import (
     CancelCurrentApplicationResponse,
     GlobalLanguageResponse,
     OnboardingCountryPickerResponse,
+    OnboardingDraftResponse,
+    OnboardingFileType,
     OnboardingLinkResponse,
     OnboardingStart,
     OnboardingUploadResponse,
@@ -49,10 +51,12 @@ async def t_bank_webhook(
 async def get_onboarding_link(
     user: CurrentUserDep,
     service: OnboardingServiceDep,
-    file_type: Annotated[str, Query(description="Тип документа (photo_selfie, и т.д.)")],
+    file_type: Annotated[OnboardingFileType, Query(description="Тип документа (photo_selfie, и т.д.)")],
     content_type: Annotated[str, Query(description="MIME-тип (image/jpeg, image/png)")],
 ) -> OnboardingUploadResponse:
-    return await service.get_onboarding_upload_url(user.id, file_type, content_type)
+    return await service.get_onboarding_upload_url(
+        user.id, user_uuid=str(user.uuid), file_type=file_type.value, content_type=content_type
+    )
 
 
 @router.get(
@@ -91,6 +95,14 @@ async def submit_survey(
     service: OnboardingServiceDep,
 ) -> SubmitSurveyResponse:
     return await service.submit_survey(user.id, data.model_dump())
+
+
+@router.get("/draft", summary="Получить текущий черновик онбординга", response_model=OnboardingDraftResponse)
+async def get_onboarding_draft(
+    user: CurrentUserDep,  # Зависимость, достающая юзера из JWT-токена
+    service: OnboardingServiceDep,  # Наш инжект OnboardingService
+) -> OnboardingDraftResponse:
+    return await service.get_current_draft(user.id)
 
 
 @router.delete("/cancel", summary="Отменить текущую заявку", response_model=CancelCurrentApplicationResponse)

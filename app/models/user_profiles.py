@@ -12,6 +12,7 @@ from app.models.spatial import CarClass
 # Импорт для типизации связи
 if TYPE_CHECKING:
     # from .excursions import Excursion
+    from .excursions import Excursion
     from .spatial import CityRegion
     from .user import User
 
@@ -75,6 +76,6 @@ class TripGuideProfile(Base):
     user: Mapped[User] = relationship("User", back_populates="trip_guide_profile")
     base_region: Mapped[CityRegion] = relationship("CityRegion")
 
-    # excursions: Mapped[list[Excursion]] = relationship(
-    #     "Excursion", back_populates="guide", cascade="all, delete-orphan"
-    # )
+    excursions: Mapped[list[Excursion]] = relationship(
+        "Excursion", back_populates="guide", cascade="all, delete-orphan"
+    )

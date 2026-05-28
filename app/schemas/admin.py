@@ -1,11 +1,15 @@
+import re
+from enum import StrEnum
+
 import phonenumbers
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.schemas.base import ActionResponse, UserBase, UserRole
+from app.schemas.base import ActionResponse, UserBase
 
 
-class AdminSetRoleRequest(BaseModel):
-    role: UserRole
+class AdminTargetRoleRequest(StrEnum):
+    ADMIN = "admin"
+    CUSTOMER = "customer"
 
 
 class UserAdminView(UserBase):
@@ -14,9 +18,35 @@ class UserAdminView(UserBase):
     pass
 
 
-class AdminActionResponse(ActionResponse):
+class AdminRoleChangeResponse(ActionResponse):
+    """Ответ при успешном изменении роли пользователя."""
+
+    user: UserAdminView
+
+
+class AdminToggleBanResponse(ActionResponse):
     is_banned: bool | None = None
     user: UserAdminView
+
+
+class AdminChangePhoneResponse(ActionResponse):
+    """Ответ после принудительной смены номера телефона."""
+
+    user: UserAdminView
+
+
+class AdminApproveOnboardingResponse(ActionResponse):
+    """Ответ при успешном одобрении партнера (водителя/гида)."""
+
+    user: UserAdminView
+
+
+class AdminRejectOnboardingResponse(ActionResponse):
+    """Ответ при успешном отклонении заявки партнера."""
+
+    user: UserAdminView
+    application_id: int = Field(..., description="ID отклоненной заявки")
+    reason: str = Field(..., description="Причина отклонения")
 
 
 class CountryView(BaseModel):
@@ -79,8 +109,29 @@ class AdminCountryCreate(BaseModel):
     )
     is_active: bool = Field(default=True)
 
-    @field_validator("iso_code")
+    @field_validator("iso_code", mode="before")
     @classmethod
     def validate_iso(cls, v: str) -> str:
-        # Автоматически приводим к верхнему регистру "ae" -> "AE"
-        return v.upper().strip()
+        # Сначала очищаем от пробелов и приводим к верхнему регистру,
+        # чтобы проверка min_length/max_length отработала корректно
+        if isinstance(v, str):
+            return v.strip().upper()
+        return v
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def validate_currency(cls, v: str) -> str:
+        # Автоматически приводим валюту к верхнему регистру ("usd" -> "USD")
+        if isinstance(v, str):
+            return v.strip().upper()
+        return v
+
+    @field_validator("license_regex")
+    @classmethod
+    def validate_regex_syntax(cls, v: str) -> str:
+        # Проверяем, компилируется ли регулярное выражение
+        try:
+            re.compile(v)
+        except re.error as e:
+            raise ValueError(f"Невалидный синтаксис регулярного выражения: {e.msg}") from e
+        return v

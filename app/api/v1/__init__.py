@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 
-from app.api.v1 import auth, onboarding, permissions, users
+from app.api.v1 import auth, excursions, guide, onboarding, payments, permissions, reviews, supplier, transfers, users
 from app.core.openapi import RouteTag
 from app.core.security import get_current_admin
 
@@ -16,5 +16,11 @@ v1_router.include_router(
     dependencies=[Depends(get_current_admin)],
 )
 v1_router.include_router(onboarding.router, prefix="/onboarding", tags=[RouteTag.ONBOARDING])
+v1_router.include_router(transfers.router, prefix="/transfers", tags=[RouteTag.TRANSFERS])
+v1_router.include_router(payments.router, prefix="/payments", tags=[RouteTag.PAYMENTS])
+v1_router.include_router(supplier.router, prefix="/supplier", tags=[RouteTag.SUPPLIERS])
+v1_router.include_router(reviews.router, prefix="/reviews", tags=[RouteTag.REVIEWS])
+v1_router.include_router(excursions.router, prefix="/excursions", tags=[RouteTag.EXCURSIONS])
+v1_router.include_router(guide.router, prefix="/guide", tags=[RouteTag.GUIDE])
 
 # v1_router.include_router(chats_router, prefix="/chats", tags=["Chats"])
